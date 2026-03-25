@@ -1,0 +1,428 @@
+import { randomUUID } from "crypto";
+import { supabase } from "@/lib/supabase";
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const EMBEDDING_BATCH_SIZE = 100;
+
+// --- Types ---
+
+interface TranscriptChunk {
+  topic: string;
+  content: string;
+  speakers: string[];
+  time_range: string;
+}
+
+interface QAPair {
+  question: string;
+  answer: string;
+  fixed_tags: string[];
+  free_tags: string[];
+  speaker: string;
+}
+
+interface ParseResult {
+  cleaned: string;
+  speakers: string[];
+  lineCount: number;
+  originalLineCount: number;
+}
+
+// --- Project Classification (from backfill-projects) ---
+
+const PROJECT_RULES: [string[], string][] = [
+  [["youtube", "yt", "動画", "サムネ", "チャンネル"], "YouTube運用"],
+  [["ミサオ", "みさお"], "ミサオch"],
+  [["あおんぼ", "顧問"], "あおんぼ顧問"],
+  [["バズ塾", "ショート"], "バズ塾"],
+  [["定例", "全体"], "全体定例"],
+];
+
+function classifyProject(mtgTitle: string): string {
+  const title = mtgTitle.toLowerCase();
+  for (const [keywords, project] of PROJECT_RULES) {
+    for (const kw of keywords) {
+      if (title.includes(kw.toLowerCase())) {
+        return project;
+      }
+    }
+  }
+  return "";
+}
+
+// --- 1. Text Parsing (Dify code_parse equivalent) ---
+
+const TIMESTAMP_REGEX = /^(\d{1,2}:\d{2}(?::\d{2})?)\s+([^:]+):\s*(.+)$/;
+const FILLER_REGEX = new RegExp(
+  "\\b(u+h+|u+m+|e+h+m*|h+m+|a+h+|m+h*m*|mhm|mm-hmm|mmhmm|" +
+    "heh|haha+|hihi+|aye|ooh|nah|" +
+    "えー+|あー+|あの+|うー+|んー+|まあ+|ええ+|そのー+)\\b[,.\\s]*",
+  "gi"
+);
+const REPEAT_REGEX = /\b(\w+)\s+(\1\s+){2,}/gi;
+const CONTENT_CHARS_REGEX = /[^a-zA-Z\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]/g;
+
+export function parseTranscript(text: string): ParseResult {
+  const lines = text.trim().split("\n");
+  const parsedLines: string[] = [];
+  const speakersSet = new Set<string>();
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    const match = line.match(TIMESTAMP_REGEX);
+    if (match) {
+      const timestamp = match[1];
+      const speaker = match[2].trim();
+      let cleaned = match[3].trim();
+
+      // Filler removal
+      cleaned = cleaned.replace(FILLER_REGEX, " ");
+      // Repeat phrase removal
+      cleaned = cleaned.replace(REPEAT_REGEX, "$1 ");
+      // Normalize whitespace
+      cleaned = cleaned.replace(/\s+/g, " ").trim();
+
+      // Skip lines with too little meaningful content
+      const contentOnly = cleaned.replace(CONTENT_CHARS_REGEX, "");
+      if (!contentOnly || contentOnly.length < 2) continue;
+
+      speakersSet.add(speaker);
+      parsedLines.push(`${timestamp} ${speaker}: ${cleaned}`);
+    }
+  }
+
+  return {
+    cleaned: parsedLines.join("\n"),
+    speakers: [...speakersSet].sort(),
+    lineCount: parsedLines.length,
+    originalLineCount: lines.length,
+  };
+}
+
+// --- 2. Chunk Splitting via GPT-4o ---
+
+async function splitIntoChunks(
+  cleaned: string,
+  speakers: string[],
+  mtgTitle: string,
+  mtgDate: string,
+  lineCount: number,
+  originalLineCount: number
+): Promise<{ chunks: TranscriptChunk[]; summary: string }> {
+  const systemPrompt = `あなたはMTGの文字起こしテキストを分析し、話題単位でチャンク分割する専門家です。
+
+## タスク
+
+文字起こしテキストを話題の区切りで分割し、各チャンクにトピック名を付けてください。
+
+## 話者情報
+
+このMTGの参加者: ${JSON.stringify(speakers)}
+
+## ルール
+
+- 1つのチャンクは1つの話題に対応させてください
+- チャンクが細かいほど、後のQA生成の精度が上がります
+- 雑談・意味のないやり取りだけのチャンクは省略してください
+- 各チャンクのcontentには話者名付きの発言をそのまま含めてください
+- タイムスタンプ情報も保持してください
+- 文字起こしの品質が低い部分（意味が通じない箇所）は除外してOKです
+- 有意義な内容が全くない場合は空配列を返してください
+
+## 出力形式
+
+必ず以下のJSON形式のみで回答してください。説明文やマークダウンは不要です。
+
+{"chunks": [{"topic": "チャンクの話題名", "content": "話者名付きの会話内容", "speakers": ["話者A", "話者B"], "time_range": "03:00-07:30"}], "summary": "MTG全体の概要（1〜2文）"}`;
+
+  const userPrompt = `以下のMTG文字起こしテキストを話題チャンクに分割してください。
+
+MTGタイトル: ${mtgTitle}
+
+日付: ${mtgDate}
+
+---文字起こし（ノイズ除去済み、${lineCount}行 / 元${originalLineCount}行）---
+
+${cleaned}`;
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      temperature: 0.3,
+      max_tokens: 16384,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`チャンク分割APIエラー: ${errText}`);
+  }
+
+  const data = await res.json();
+  const finishReason = data.choices?.[0]?.finish_reason;
+  if (finishReason === "length") {
+    throw new Error("チャンク分割: レスポンスが長すぎて途中で切断されました。テキストを短くして再試行してください。");
+  }
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error("チャンク分割: レスポンスが空です");
+
+  const parsed = JSON.parse(content);
+  return {
+    chunks: parsed.chunks || [],
+    summary: parsed.summary || "",
+  };
+}
+
+// --- 3. QA Generation via GPT-4o ---
+
+async function generateQAPairs(chunkJson: string): Promise<QAPair[]> {
+  const systemPrompt = `あなたはMTGの会話チャンクからQ&Aナレッジを生成する専門家です。
+
+## タスク
+
+与えられた会話チャンクから、検索可能なQ&Aペアを生成してください。
+
+## 固定タグ（YouTube運用カテゴリ）
+
+以下から該当するものを選択してください（複数可）：
+
+- 企画
+- 撮影
+- 編集
+- サムネ
+- タイトル
+- 分析
+- 運用全般
+
+## 自由タグ
+
+会話内容から適切なキーワードタグを自動生成してください（例：CTR改善、冒頭離脱、コメント誘導など）
+
+## ルール
+
+- 1チャンクから複数のQAを生成してください（粒度は細かいほど良い）
+- Questionは「〜とは？」「〜はどうすればいい？」など検索されやすい形にしてください
+- Answerは具体的で、会話の文脈がなくても理解できる形にしてください
+- 話者情報も保持してください（誰が言った知見か分かるように）
+- 文字起こしの品質が低く意味が不明確な部分からは無理にQAを作らないでください
+- QAが1つも作れない場合は空配列を返してください
+
+## 出力形式
+
+必ず以下のJSON形式のみで回答してください。説明文やマークダウンは不要です。
+
+{"qa_pairs": [{"question": "質問文", "answer": "回答文", "fixed_tags": ["タグ1"], "free_tags": ["キーワード1"], "speaker": "話者名"}]}`;
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      temperature: 0.4,
+      max_tokens: 16384,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `以下の会話チャンクからQ&Aナレッジを生成してください。\n\n${chunkJson}` },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`QA生成APIエラー: ${errText}`);
+  }
+
+  const data = await res.json();
+  const finishReason = data.choices?.[0]?.finish_reason;
+  if (finishReason === "length") {
+    throw new Error("QA生成: レスポンスが長すぎて途中で切断されました");
+  }
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error("QA生成: レスポンスが空です");
+
+  const parsed = JSON.parse(content);
+  return parsed.qa_pairs || [];
+}
+
+// --- 4. Embedding Generation ---
+
+async function generateEmbeddings(
+  rows: { id: string; question: string; answer: string }[],
+  send: (data: Record<string, unknown>) => void
+): Promise<number> {
+  let processed = 0;
+
+  for (let i = 0; i < rows.length; i += EMBEDDING_BATCH_SIZE) {
+    const batch = rows.slice(i, i + EMBEDDING_BATCH_SIZE);
+    const texts = batch.map((r) => `${r.question} ${r.answer}`);
+
+    const embRes = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "text-embedding-3-small",
+        input: texts,
+      }),
+    });
+
+    if (!embRes.ok) {
+      const errText = await embRes.text();
+      send({
+        event: "node_finished",
+        data: { status: "failed", title: "Embedding生成", error: `OpenAI APIエラー: ${errText}` },
+      });
+      return processed;
+    }
+
+    const embData = await embRes.json();
+    const embeddings = embData.data || [];
+
+    for (let j = 0; j < batch.length; j++) {
+      if (j < embeddings.length) {
+        const { error: updateError } = await supabase
+          .from("qa_knowledge")
+          .update({ embedding: embeddings[j].embedding })
+          .eq("id", batch[j].id);
+
+        if (updateError) {
+          send({
+            event: "node_finished",
+            data: { status: "failed", title: "Embedding更新", error: `ID ${batch[j].id}: ${updateError.message}` },
+          });
+        }
+      }
+    }
+
+    processed += batch.length;
+  }
+
+  return processed;
+}
+
+// --- 5. Main Pipeline ---
+
+export async function runKnowledgePipeline(
+  input: { text: string; mtgTitle: string; mtgDate: string },
+  send: (data: Record<string, unknown>) => void
+): Promise<void> {
+  const { text, mtgTitle, mtgDate } = input;
+
+  // Step 1: Text parsing
+  send({ event: "node_started", data: { title: "テキスト解析" } });
+  const parsed = parseTranscript(text);
+
+  if (parsed.lineCount === 0) {
+    throw new Error("有効な行がありません。タイムスタンプ付きの文字起こしテキストを入力してください。");
+  }
+  send({ event: "node_finished", data: { status: "succeeded", title: "テキスト解析" } });
+
+  // Step 2: Chunk splitting
+  send({ event: "node_started", data: { title: "チャンク分割" } });
+  const { chunks, summary } = await splitIntoChunks(
+    parsed.cleaned,
+    parsed.speakers,
+    mtgTitle,
+    mtgDate,
+    parsed.lineCount,
+    parsed.originalLineCount
+  );
+
+  if (chunks.length === 0) {
+    throw new Error("チャンク分割の結果が空です。有意義な内容が見つかりませんでした。");
+  }
+  send({ event: "node_finished", data: { status: "succeeded", title: "チャンク分割" } });
+
+  // Step 3: QA generation per chunk
+  const allQAPairs: (QAPair & { topic: string; time_range: string })[] = [];
+  const totalChunks = chunks.length;
+
+  for (let i = 0; i < totalChunks; i++) {
+    const chunk = chunks[i];
+    const stepTitle = `QA生成 (${i + 1}/${totalChunks}): ${chunk.topic}`;
+    send({ event: "node_started", data: { title: stepTitle } });
+
+    try {
+      const qaPairs = await generateQAPairs(JSON.stringify(chunk));
+      for (const qa of qaPairs) {
+        allQAPairs.push({ ...qa, topic: chunk.topic, time_range: chunk.time_range });
+      }
+      send({ event: "node_finished", data: { status: "succeeded", title: stepTitle } });
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : "不明なエラー";
+      send({ event: "node_finished", data: { status: "failed", title: stepTitle, error: errorMsg } });
+      // Skip failed chunk and continue
+    }
+  }
+
+  if (allQAPairs.length === 0) {
+    throw new Error("QAペアが1つも生成できませんでした。");
+  }
+
+  // Step 4: Database insert
+  send({ event: "node_started", data: { title: "データベース書き込み" } });
+  const project = classifyProject(mtgTitle);
+
+  const rows = allQAPairs.map((qa) => ({
+    id: randomUUID(),
+    mtg_title: mtgTitle,
+    mtg_date: mtgDate,
+    topic: qa.topic,
+    time_range: qa.time_range,
+    question: qa.question,
+    answer: qa.answer,
+    fixed_tags: qa.fixed_tags.join(", "),
+    free_tags: qa.free_tags.join(", "),
+    speaker: qa.speaker,
+    project,
+    status: "active" as const,
+  }));
+
+  const { data: insertedRows, error: insertError } = await supabase
+    .from("qa_knowledge")
+    .insert(rows)
+    .select("id, question, answer");
+
+  if (insertError) {
+    throw new Error(`データベース書き込みエラー: ${insertError.message}`);
+  }
+  send({ event: "node_finished", data: { status: "succeeded", title: "データベース書き込み" } });
+
+  // Step 5: Embedding generation
+  send({ event: "node_started", data: { title: "Embedding生成" } });
+  if (insertedRows && insertedRows.length > 0) {
+    await generateEmbeddings(insertedRows, send);
+  }
+  send({ event: "node_finished", data: { status: "succeeded", title: "Embedding生成" } });
+
+  // Step 6: Complete
+  send({
+    event: "workflow_finished",
+    data: {
+      status: "succeeded",
+      outputs: {
+        chunk_count: chunks.length,
+        qa_count: allQAPairs.length,
+        summary,
+      },
+    },
+  });
+}
