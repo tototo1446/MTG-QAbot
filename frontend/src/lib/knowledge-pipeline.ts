@@ -2,6 +2,8 @@ import { randomUUID } from "crypto";
 import { supabase } from "@/lib/supabase";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_LLM_MODEL = "gemini-2.5-flash";
 const EMBEDDING_BATCH_SIZE = 100;
 
 // --- Types ---
@@ -101,7 +103,7 @@ export function parseTranscript(text: string): ParseResult {
   };
 }
 
-// --- 2. Chunk Splitting via GPT-4o ---
+// --- 2. Chunk Splitting via Gemini ---
 
 async function splitIntoChunks(
   cleaned: string,
@@ -147,23 +149,22 @@ MTGタイトル: ${mtgTitle}
 
 ${cleaned}`;
 
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      temperature: 0.3,
-      max_tokens: 16384,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-    }),
-  });
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_LLM_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ parts: [{ text: userPrompt }] }],
+        generationConfig: {
+          temperature: 0.3,
+          responseMimeType: "application/json",
+          maxOutputTokens: 65536,
+        },
+      }),
+    }
+  );
 
   if (!res.ok) {
     const errText = await res.text();
@@ -171,11 +172,11 @@ ${cleaned}`;
   }
 
   const data = await res.json();
-  const finishReason = data.choices?.[0]?.finish_reason;
-  if (finishReason === "length") {
+  const finishReason = data.candidates?.[0]?.finishReason;
+  if (finishReason === "MAX_TOKENS") {
     throw new Error("チャンク分割: レスポンスが長すぎて途中で切断されました。テキストを短くして再試行してください。");
   }
-  const content = data.choices?.[0]?.message?.content;
+  const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!content) throw new Error("チャンク分割: レスポンスが空です");
 
   const parsed = JSON.parse(content);
@@ -185,7 +186,7 @@ ${cleaned}`;
   };
 }
 
-// --- 3. QA Generation via GPT-4o ---
+// --- 3. QA Generation via Gemini ---
 
 async function generateQAPairs(chunkJson: string): Promise<QAPair[]> {
   const systemPrompt = `あなたはMTGの会話チャンクからQ&Aナレッジを生成する専門家です。
@@ -225,23 +226,22 @@ async function generateQAPairs(chunkJson: string): Promise<QAPair[]> {
 
 {"qa_pairs": [{"question": "質問文", "answer": "回答文", "fixed_tags": ["タグ1"], "free_tags": ["キーワード1"], "speaker": "話者名"}]}`;
 
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      temperature: 0.4,
-      max_tokens: 16384,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: `以下の会話チャンクからQ&Aナレッジを生成してください。\n\n${chunkJson}` },
-      ],
-    }),
-  });
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_LLM_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ parts: [{ text: `以下の会話チャンクからQ&Aナレッジを生成してください。\n\n${chunkJson}` }] }],
+        generationConfig: {
+          temperature: 0.4,
+          responseMimeType: "application/json",
+          maxOutputTokens: 65536,
+        },
+      }),
+    }
+  );
 
   if (!res.ok) {
     const errText = await res.text();
@@ -249,11 +249,11 @@ async function generateQAPairs(chunkJson: string): Promise<QAPair[]> {
   }
 
   const data = await res.json();
-  const finishReason = data.choices?.[0]?.finish_reason;
-  if (finishReason === "length") {
+  const finishReason = data.candidates?.[0]?.finishReason;
+  if (finishReason === "MAX_TOKENS") {
     throw new Error("QA生成: レスポンスが長すぎて途中で切断されました");
   }
-  const content = data.choices?.[0]?.message?.content;
+  const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!content) throw new Error("QA生成: レスポンスが空です");
 
   const parsed = JSON.parse(content);
