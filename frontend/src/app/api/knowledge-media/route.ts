@@ -9,12 +9,13 @@ export const maxDuration = 300;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 
 /**
- * メディア処理API — 4つのアクションを処理:
+ * メディア処理API — 3つのアクションを処理:
  *
  * 1. FormData (default)        → 小さいファイルの直接文字起こし (SSE)
  * 2. JSON action="init"        → Gemini File API resumable upload 開始
- * 3. FormData action="upload-chunk" → チャンクを Gemini へプロキシ
- * 4. JSON action="transcribe"  → fileUri から文字起こし (SSE)
+ * 3. JSON action="transcribe"  → fileUri から文字起こし (SSE)
+ *
+ * 大きいファイルはクライアントが Gemini uploadUrl へ直接アップロード
  */
 export async function POST(request: NextRequest) {
   const contentType = request.headers.get("content-type") || "";
@@ -31,10 +32,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // FormData: direct upload or chunk upload
+    // FormData: direct upload
     const formData = await request.formData();
-    const action = formData.get("action") as string | null;
-    if (action === "upload-chunk") return handleUploadChunk(formData);
     return handleDirectTranscribe(formData);
   } catch (err) {
     const message =
@@ -91,66 +90,6 @@ async function handleInit(body: {
   }
 
   return NextResponse.json({ uploadUrl });
-}
-
-/**
- * Upload-chunk: クライアントから受け取ったチャンクを Gemini File API へプロキシ
- */
-async function handleUploadChunk(formData: FormData) {
-  const uploadUrl = formData.get("uploadUrl") as string;
-  const chunk = formData.get("chunk") as Blob | null;
-  const offset = formData.get("offset") as string;
-  const isLast = formData.get("isLast") === "true";
-
-  if (!uploadUrl || !chunk) {
-    return NextResponse.json(
-      { error: "uploadUrl と chunk は必須です" },
-      { status: 400 }
-    );
-  }
-
-  const chunkBuffer = new Uint8Array(await chunk.arrayBuffer());
-
-  const res = await fetch(uploadUrl, {
-    method: "PUT",
-    headers: {
-      "X-Goog-Upload-Command": isLast ? "upload, finalize" : "upload",
-      "X-Goog-Upload-Offset": offset || "0",
-      "Content-Length": String(chunkBuffer.length),
-    },
-    body: chunkBuffer,
-  });
-
-  if (!isLast) {
-    if (!res.ok) {
-      const error = await res.text();
-      return NextResponse.json(
-        { error: `チャンクアップロード失敗: ${error}` },
-        { status: 502 }
-      );
-    }
-    return NextResponse.json({ ok: true });
-  }
-
-  // 最終チャンク: ファイル情報を取得
-  if (!res.ok) {
-    const error = await res.text();
-    return NextResponse.json(
-      { error: `ファイナライズ失敗: ${error}` },
-      { status: 502 }
-    );
-  }
-
-  const fileInfo = await res.json();
-  const fileUri = fileInfo.file?.uri;
-  if (!fileUri) {
-    return NextResponse.json(
-      { error: "ファイルURIの取得に失敗しました" },
-      { status: 502 }
-    );
-  }
-
-  return NextResponse.json({ fileUri, fileName: fileInfo.file?.name });
 }
 
 /**

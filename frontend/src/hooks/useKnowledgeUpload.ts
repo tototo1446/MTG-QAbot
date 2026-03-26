@@ -164,7 +164,6 @@ export function useKnowledgeUpload() {
   return { step, error, result, nodeStatus, errorAtStep, failedNode, upload, reset };
 }
 
-const CHUNK_SIZE = 3 * 1024 * 1024; // 3MB per chunk
 const SIZE_THRESHOLD = 4 * 1024 * 1024; // 4MB — Vercel body size limit対策
 
 /**
@@ -209,10 +208,10 @@ async function transcribeMediaDirect(
 }
 
 /**
- * 大きいファイル（>= 4MB）: Gemini File API経由のチャンクアップロード
- * 1. init → uploadUrl取得
- * 2. upload-chunk × N → チャンク送信
- * 3. transcribe → fileUriで文字起こし
+ * 大きいファイル（>= 4MB）: Gemini File API へ直接アップロード
+ * 1. init → サーバー経由で uploadUrl 取得（APIキーはサーバー側に保持）
+ * 2. クライアントから Gemini uploadUrl へ直接 PUT（Vercel body制限を回避）
+ * 3. transcribe → サーバー経由で fileUri から文字起こし
  */
 async function transcribeMediaChunked(
   file: File,
@@ -220,7 +219,7 @@ async function transcribeMediaChunked(
 ): Promise<string> {
   const mimeType = file.type || getMediaMimeType(file.name);
 
-  // Step 1: resumable upload 初期化
+  // Step 1: サーバー経由で resumable upload を初期化
   onProgress("アップロードを初期化中...");
   const initRes = await fetch("/api/knowledge-media", {
     method: "POST",
@@ -244,50 +243,29 @@ async function transcribeMediaChunked(
 
   const { uploadUrl } = await initRes.json();
 
-  // Step 2: チャンクアップロード
-  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-  let fileUri = "";
+  // Step 2: Gemini へ直接アップロード（単一 "upload, finalize"）
+  onProgress("ファイルをアップロード中...");
+  const uploadRes = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: {
+      "X-Goog-Upload-Command": "upload, finalize",
+      "X-Goog-Upload-Offset": "0",
+    },
+    body: file,
+  });
 
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * CHUNK_SIZE;
-    const end = Math.min(start + CHUNK_SIZE, file.size);
-    const chunk = file.slice(start, end);
-    const isLast = i === totalChunks - 1;
-
-    onProgress(`アップロード中... (${i + 1}/${totalChunks})`);
-
-    const chunkForm = new FormData();
-    chunkForm.append("action", "upload-chunk");
-    chunkForm.append("uploadUrl", uploadUrl);
-    chunkForm.append("chunk", chunk);
-    chunkForm.append("offset", String(start));
-    chunkForm.append("isLast", String(isLast));
-
-    const chunkRes = await fetch("/api/knowledge-media", {
-      method: "POST",
-      body: chunkForm,
-    });
-
-    if (!chunkRes.ok) {
-      const errorData = await chunkRes
-        .json()
-        .catch(() => ({ error: chunkRes.statusText }));
-      throw new Error(
-        `チャンクアップロード失敗 (${i + 1}/${totalChunks}): ${errorData.error}`
-      );
-    }
-
-    if (isLast) {
-      const result = await chunkRes.json();
-      fileUri = result.fileUri;
-    }
+  if (!uploadRes.ok) {
+    const error = await uploadRes.text().catch(() => "");
+    throw new Error(`ファイルアップロード失敗: ${error}`);
   }
 
+  const fileInfo = await uploadRes.json();
+  const fileUri = fileInfo.file?.uri;
   if (!fileUri) {
     throw new Error("ファイルURIの取得に失敗しました");
   }
 
-  // Step 3: fileUri で文字起こし
+  // Step 3: サーバー経由で文字起こし
   onProgress("文字起こし中...");
   const transcribeRes = await fetch("/api/knowledge-media", {
     method: "POST",
