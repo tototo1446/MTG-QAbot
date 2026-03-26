@@ -2,38 +2,40 @@ import { NextRequest, NextResponse } from "next/server";
 import { isMediaFile } from "@/lib/media-preprocessor";
 import { GeminiTranscriptionProvider } from "@/lib/transcription";
 import { normalizeWhisperDiarized } from "@/lib/transcript-normalizer";
+import { writeFile, readFile, readdir, mkdir, rm } from "fs/promises";
+import { join } from "path";
+import { tmpdir } from "os";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-
 /**
- * メディア処理API — 3つのアクションを処理:
+ * メディア処理API
  *
- * 1. FormData (default)        → 小さいファイルの直接文字起こし (SSE)
- * 2. JSON action="init"        → Gemini File API resumable upload 開始
- * 3. JSON action="transcribe"  → fileUri から文字起こし (SSE)
- *
- * 大きいファイルはクライアントが Gemini uploadUrl へ直接アップロード
+ * 1. FormData (default)                  → 小さいファイル直接文字起こし (SSE)
+ * 2. FormData action="upload-part"       → チャンクを /tmp に保存
+ * 3. JSON action="transcribe-assembled"  → /tmp のチャンクを結合して文字起こし (SSE)
  */
 export async function POST(request: NextRequest) {
   const contentType = request.headers.get("content-type") || "";
 
   try {
-    // JSON: init or transcribe
+    // JSON: transcribe-assembled
     if (contentType.includes("application/json")) {
       const body = await request.json();
-      if (body.action === "init") return handleInit(body);
-      if (body.action === "transcribe") return handleTranscribe(body);
+      if (body.action === "transcribe-assembled") {
+        return handleTranscribeAssembled(body);
+      }
       return NextResponse.json(
         { error: `不明なアクション: ${body.action}` },
         { status: 400 }
       );
     }
 
-    // FormData: direct upload
+    // FormData: upload-part or direct transcribe
     const formData = await request.formData();
+    const action = formData.get("action") as string | null;
+    if (action === "upload-part") return handleUploadPart(formData);
     return handleDirectTranscribe(formData);
   } catch (err) {
     const message =
@@ -42,69 +44,73 @@ export async function POST(request: NextRequest) {
   }
 }
 
-/**
- * Init: Gemini File API の resumable upload を開始し uploadUrl を返す
- */
-async function handleInit(body: {
-  fileName?: string;
-  fileSize?: number;
-  mimeType?: string;
-}) {
-  if (!GEMINI_API_KEY) {
-    return NextResponse.json(
-      { error: "GEMINI_API_KEY が未設定です" },
-      { status: 500 }
-    );
-  }
+// UUID形式のバリデーション（パストラバーサル防止）
+function isValidSessionId(id: string): boolean {
+  return /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(
+    id
+  );
+}
 
-  const { fileName, fileSize, mimeType } = body;
-  if (!fileName || !fileSize || !mimeType) {
+/**
+ * upload-part: クライアントから受け取ったチャンクを /tmp に保存
+ */
+async function handleUploadPart(formData: FormData) {
+  const sessionId = formData.get("sessionId") as string;
+  const index = formData.get("index") as string;
+  const chunk = formData.get("chunk") as Blob | null;
+
+  if (!sessionId || index === null || !chunk) {
     return NextResponse.json(
-      { error: "fileName, fileSize, mimeType は必須です" },
+      { error: "sessionId, index, chunk は必須です" },
       { status: 400 }
     );
   }
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: {
-        "X-Goog-Upload-Protocol": "resumable",
-        "X-Goog-Upload-Command": "start",
-        "X-Goog-Upload-Header-Content-Length": String(fileSize),
-        "X-Goog-Upload-Header-Content-Type": mimeType,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ file: { displayName: fileName } }),
-    }
-  );
-
-  const uploadUrl = res.headers.get("X-Goog-Upload-URL");
-  if (!uploadUrl) {
-    const error = await res.text();
+  if (!isValidSessionId(sessionId)) {
     return NextResponse.json(
-      { error: `Gemini File API のアップロードURL取得に失敗: ${error}` },
-      { status: 502 }
+      { error: "不正なセッションIDです" },
+      { status: 400 }
     );
   }
 
-  return NextResponse.json({ uploadUrl });
+  const sessionDir = join(tmpdir(), `media-upload-${sessionId}`);
+  await mkdir(sessionDir, { recursive: true });
+
+  const chunkBuffer = Buffer.from(await chunk.arrayBuffer());
+  const paddedIndex = String(index).padStart(5, "0");
+  await writeFile(join(sessionDir, `part-${paddedIndex}`), chunkBuffer);
+
+  return NextResponse.json({ ok: true });
 }
 
 /**
- * Transcribe: アップロード済み fileUri から文字起こし → SSE ストリーム
+ * transcribe-assembled: /tmp のチャンクを結合 → Gemini で文字起こし → SSE ストリーム
  */
-function handleTranscribe(body: { fileUri?: string; mimeType?: string }) {
-  const { fileUri, mimeType } = body;
-  if (!fileUri || !mimeType) {
+function handleTranscribeAssembled(body: {
+  sessionId?: string;
+  fileName?: string;
+  mimeType?: string;
+  totalParts?: number;
+}) {
+  const { sessionId, fileName, mimeType, totalParts } = body;
+
+  if (!sessionId || !fileName || !mimeType || !totalParts) {
     return NextResponse.json(
-      { error: "fileUri と mimeType は必須です" },
+      { error: "sessionId, fileName, mimeType, totalParts は必須です" },
+      { status: 400 }
+    );
+  }
+
+  if (!isValidSessionId(sessionId)) {
+    return NextResponse.json(
+      { error: "不正なセッションIDです" },
       { status: 400 }
     );
   }
 
   const encoder = new TextEncoder();
+  const sessionDir = join(tmpdir(), `media-upload-${sessionId}`);
+
   const stream = new ReadableStream({
     async start(controller) {
       const send = (data: Record<string, unknown>) => {
@@ -114,14 +120,41 @@ function handleTranscribe(body: { fileUri?: string; mimeType?: string }) {
       };
 
       try {
+        // Step 1: チャンクを結合
+        send({
+          event: "progress",
+          step: "assembling",
+          message: "ファイルを組み立て中...",
+        });
+
+        const files = await readdir(sessionDir);
+        const sortedFiles = files
+          .filter((f) => f.startsWith("part-"))
+          .sort();
+
+        if (sortedFiles.length !== totalParts) {
+          throw new Error(
+            `チャンク数が一致しません（期待: ${totalParts}, 実際: ${sortedFiles.length}）。再度アップロードしてください`
+          );
+        }
+
+        const chunks: Buffer[] = [];
+        for (const file of sortedFiles) {
+          chunks.push(await readFile(join(sessionDir, file)));
+        }
+        const fileBuffer = Buffer.concat(chunks);
+
         send({
           event: "progress",
           step: "transcribing",
           message: "文字起こし中...",
+          fileSize: fileBuffer.length,
         });
 
+        // Step 2: Gemini で文字起こし
+        // gemini-provider が 15MB 超は自動で File API アップロードを行う
         const provider = new GeminiTranscriptionProvider();
-        const result = await provider.transcribeFromUri(fileUri, mimeType);
+        const result = await provider.transcribe(fileBuffer, fileName);
 
         send({
           event: "progress",
@@ -130,6 +163,7 @@ function handleTranscribe(body: { fileUri?: string; mimeType?: string }) {
           segmentCount: result.segments.length,
         });
 
+        // Step 3: 正規化
         const normalized = normalizeWhisperDiarized(result.segments);
 
         send({
@@ -146,9 +180,13 @@ function handleTranscribe(body: { fileUri?: string; mimeType?: string }) {
           message:
             err instanceof Error
               ? err.message
-              : "文字起こし中にエラーが発生しました",
+              : "メディア処理中にエラーが発生しました",
         });
       } finally {
+        // /tmp クリーンアップ
+        await rm(sessionDir, { recursive: true, force: true }).catch(
+          () => {}
+        );
         controller.close();
       }
     },
@@ -164,8 +202,7 @@ function handleTranscribe(body: { fileUri?: string; mimeType?: string }) {
 }
 
 /**
- * Direct: 小さいファイルを FormData で受け取り直接文字起こし → SSE ストリーム
- * FFmpeg 不要 — Gemini API がメディアファイルをネイティブサポート
+ * Direct: 小さいファイル（< 4MB）を FormData で受け取り直接文字起こし
  */
 function handleDirectTranscribe(formData: FormData) {
   const file = formData.get("file") as File | null;

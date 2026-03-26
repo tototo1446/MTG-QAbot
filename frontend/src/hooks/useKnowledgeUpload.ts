@@ -164,6 +164,7 @@ export function useKnowledgeUpload() {
   return { step, error, result, nodeStatus, errorAtStep, failedNode, upload, reset };
 }
 
+const CHUNK_SIZE = 3 * 1024 * 1024; // 3MB per chunk（Vercel 4.5MB body制限内）
 const SIZE_THRESHOLD = 4 * 1024 * 1024; // 4MB — Vercel body size limit対策
 
 /**
@@ -208,72 +209,58 @@ async function transcribeMediaDirect(
 }
 
 /**
- * 大きいファイル（>= 4MB）: Gemini File API へ直接アップロード
- * 1. init → サーバー経由で uploadUrl 取得（APIキーはサーバー側に保持）
- * 2. クライアントから Gemini uploadUrl へ直接 PUT（Vercel body制限を回避）
- * 3. transcribe → サーバー経由で fileUri から文字起こし
+ * 大きいファイル（>= 4MB）: サーバーの /tmp にチャンク蓄積 → 結合して文字起こし
+ * 1. 3MBチャンクに分割してサーバーへ順次送信（Vercel body制限内）
+ * 2. 全チャンク送信後、サーバー側で結合 → Gemini 文字起こし
  */
 async function transcribeMediaChunked(
   file: File,
   onProgress: (msg: string) => void
 ): Promise<string> {
-  const mimeType = file.type || getMediaMimeType(file.name);
+  const sessionId = crypto.randomUUID();
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-  // Step 1: サーバー経由で resumable upload を初期化
-  onProgress("アップロードを初期化中...");
-  const initRes = await fetch("/api/knowledge-media", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      action: "init",
-      fileName: file.name,
-      fileSize: file.size,
-      mimeType,
-    }),
-  });
+  // Step 1: チャンクをサーバーへ送信
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, file.size);
+    const chunk = file.slice(start, end);
 
-  if (!initRes.ok) {
-    const errorData = await initRes
-      .json()
-      .catch(() => ({ error: initRes.statusText }));
-    throw new Error(
-      `アップロード初期化失敗: ${errorData.error || initRes.statusText}`
-    );
+    onProgress(`アップロード中... (${i + 1}/${totalChunks})`);
+
+    const formData = new FormData();
+    formData.append("action", "upload-part");
+    formData.append("sessionId", sessionId);
+    formData.append("index", String(i));
+    formData.append("chunk", chunk);
+
+    const res = await fetch("/api/knowledge-media", {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!res.ok) {
+      const errorData = await res
+        .json()
+        .catch(() => ({ error: res.statusText }));
+      throw new Error(
+        `チャンクアップロード失敗 (${i + 1}/${totalChunks}): ${errorData.error}`
+      );
+    }
   }
 
-  const { uploadUrl } = await initRes.json();
-
-  // Step 2: Gemini へ直接アップロード（単一 "upload, finalize"）
-  onProgress("ファイルをアップロード中...");
-  const uploadRes = await fetch(uploadUrl, {
-    method: "PUT",
-    headers: {
-      "X-Goog-Upload-Command": "upload, finalize",
-      "X-Goog-Upload-Offset": "0",
-    },
-    body: file,
-  });
-
-  if (!uploadRes.ok) {
-    const error = await uploadRes.text().catch(() => "");
-    throw new Error(`ファイルアップロード失敗: ${error}`);
-  }
-
-  const fileInfo = await uploadRes.json();
-  const fileUri = fileInfo.file?.uri;
-  if (!fileUri) {
-    throw new Error("ファイルURIの取得に失敗しました");
-  }
-
-  // Step 3: サーバー経由で文字起こし
+  // Step 2: サーバーでチャンク結合 + 文字起こし
   onProgress("文字起こし中...");
+  const mimeType = file.type || getMediaMimeType(file.name);
   const transcribeRes = await fetch("/api/knowledge-media", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      action: "transcribe",
-      fileUri,
+      action: "transcribe-assembled",
+      sessionId,
+      fileName: file.name,
       mimeType,
+      totalParts: totalChunks,
     }),
   });
 
