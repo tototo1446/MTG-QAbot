@@ -86,7 +86,7 @@ async function handleUploadPart(formData: FormData) {
 /**
  * transcribe-assembled: /tmp のチャンクを結合 → Gemini で文字起こし → SSE ストリーム
  */
-function handleTranscribeAssembled(body: {
+async function handleTranscribeAssembled(body: {
   sessionId?: string;
   fileName?: string;
   mimeType?: string;
@@ -108,8 +108,43 @@ function handleTranscribeAssembled(body: {
     );
   }
 
-  const encoder = new TextEncoder();
   const sessionDir = join(tmpdir(), `media-upload-${sessionId}`);
+
+  // チャンクの存在チェック — 不足があれば 409 + 不足インデックスを返す
+  let existingFiles: string[] = [];
+  try {
+    existingFiles = await readdir(sessionDir);
+  } catch {
+    // ディレクトリが存在しない = チャンクが一つもない
+    return NextResponse.json(
+      {
+        error: "missing_chunks",
+        missingIndices: Array.from({ length: totalParts }, (_, i) => i),
+      },
+      { status: 409 }
+    );
+  }
+
+  const sortedFiles = existingFiles
+    .filter((f) => f.startsWith("part-"))
+    .sort();
+
+  if (sortedFiles.length !== totalParts) {
+    const presentIndices = new Set(
+      sortedFiles.map((f) => parseInt(f.replace("part-", ""), 10))
+    );
+    const missingIndices: number[] = [];
+    for (let i = 0; i < totalParts; i++) {
+      if (!presentIndices.has(i)) missingIndices.push(i);
+    }
+    return NextResponse.json(
+      { error: "missing_chunks", missingIndices },
+      { status: 409 }
+    );
+  }
+
+  // 全チャンク揃った — SSE ストリームで処理開始
+  const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -120,23 +155,11 @@ function handleTranscribeAssembled(body: {
       };
 
       try {
-        // Step 1: チャンクを結合
         send({
           event: "progress",
           step: "assembling",
           message: "ファイルを組み立て中...",
         });
-
-        const files = await readdir(sessionDir);
-        const sortedFiles = files
-          .filter((f) => f.startsWith("part-"))
-          .sort();
-
-        if (sortedFiles.length !== totalParts) {
-          throw new Error(
-            `チャンク数が一致しません（期待: ${totalParts}, 実際: ${sortedFiles.length}）。再度アップロードしてください`
-          );
-        }
 
         const chunks: Buffer[] = [];
         for (const file of sortedFiles) {

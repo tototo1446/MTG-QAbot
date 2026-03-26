@@ -212,6 +212,7 @@ async function transcribeMediaDirect(
  * 大きいファイル（>= 4MB）: サーバーの /tmp にチャンク蓄積 → 結合して文字起こし
  * 1. 3MBチャンクに分割してサーバーへ順次送信（Vercel body制限内）
  * 2. 全チャンク送信後、サーバー側で結合 → Gemini 文字起こし
+ * 3. 不足チャンクがあれば自動リトライ（サーバーレスのインスタンス分散対策）
  */
 async function transcribeMediaChunked(
   file: File,
@@ -220,58 +221,100 @@ async function transcribeMediaChunked(
   const sessionId = crypto.randomUUID();
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-  // Step 1: チャンクをサーバーへ送信
+  // Step 1: 全チャンクをサーバーへ送信
   for (let i = 0; i < totalChunks; i++) {
-    const start = i * CHUNK_SIZE;
-    const end = Math.min(start + CHUNK_SIZE, file.size);
-    const chunk = file.slice(start, end);
+    await sendChunk(file, sessionId, i, totalChunks, onProgress);
+  }
 
-    onProgress(`アップロード中... (${i + 1}/${totalChunks})`);
+  // Step 2: 結合+文字起こし（不足チャンクがあればリトライ）
+  const mimeType = file.type || getMediaMimeType(file.name);
+  const MAX_RETRIES = 5;
 
-    const formData = new FormData();
-    formData.append("action", "upload-part");
-    formData.append("sessionId", sessionId);
-    formData.append("index", String(i));
-    formData.append("chunk", chunk);
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    onProgress(
+      attempt > 0 ? "不足チャンクを再送中..." : "文字起こし中..."
+    );
 
     const res = await fetch("/api/knowledge-media", {
       method: "POST",
-      body: formData,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "transcribe-assembled",
+        sessionId,
+        fileName: file.name,
+        mimeType,
+        totalParts: totalChunks,
+      }),
     });
 
-    if (!res.ok) {
-      const errorData = await res
-        .json()
-        .catch(() => ({ error: res.statusText }));
+    // 409 = チャンク不足 → 不足分を再送してリトライ
+    if (res.status === 409) {
+      const data = await res.json();
+      const missing: number[] = data.missingIndices || [];
+
+      if (attempt >= MAX_RETRIES) {
+        throw new Error(
+          `チャンクアップロードに失敗しました（${missing.length}個が不足）`
+        );
+      }
+
+      onProgress(
+        `不足チャンクを再送中... (${missing.length}個)`
+      );
+      for (const idx of missing) {
+        await sendChunk(file, sessionId, idx, totalChunks, onProgress);
+      }
+      continue;
+    }
+
+    if (!res.ok || !res.body) {
+      const errorText = await res.text().catch(() => "");
       throw new Error(
-        `チャンクアップロード失敗 (${i + 1}/${totalChunks}): ${errorData.error}`
+        `文字起こしAPI呼び出し失敗 (${res.status}): ${errorText || res.statusText}`
       );
     }
+
+    return readSSEResult(res.body, onProgress);
   }
 
-  // Step 2: サーバーでチャンク結合 + 文字起こし
-  onProgress("文字起こし中...");
-  const mimeType = file.type || getMediaMimeType(file.name);
-  const transcribeRes = await fetch("/api/knowledge-media", {
+  throw new Error("最大リトライ回数を超えました");
+}
+
+/**
+ * 単一チャンクをサーバーへ送信
+ */
+async function sendChunk(
+  file: File,
+  sessionId: string,
+  index: number,
+  totalChunks: number,
+  onProgress: (msg: string) => void
+): Promise<void> {
+  const start = index * CHUNK_SIZE;
+  const end = Math.min(start + CHUNK_SIZE, file.size);
+  const chunk = file.slice(start, end);
+
+  onProgress(`アップロード中... (${index + 1}/${totalChunks})`);
+
+  const formData = new FormData();
+  formData.append("action", "upload-part");
+  formData.append("sessionId", sessionId);
+  formData.append("index", String(index));
+  formData.append("chunk", chunk);
+
+  const res = await fetch("/api/knowledge-media", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      action: "transcribe-assembled",
-      sessionId,
-      fileName: file.name,
-      mimeType,
-      totalParts: totalChunks,
-    }),
+    body: formData,
   });
 
-  if (!transcribeRes.ok || !transcribeRes.body) {
-    const errorText = await transcribeRes.text().catch(() => "");
+  if (!res.ok) {
+    const errorData = await res
+      .json()
+      .catch(() => ({ error: res.statusText }));
     throw new Error(
-      `文字起こしAPI呼び出し失敗 (${transcribeRes.status}): ${errorText || transcribeRes.statusText}`
+      `チャンクアップロード失敗 (${index + 1}/${totalChunks}): ${errorData.error}`
     );
   }
-
-  return readSSEResult(transcribeRes.body, onProgress);
 }
 
 /**
