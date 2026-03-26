@@ -35,6 +35,37 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
             },
           };
 
+    return this.generateTranscription(audioPart);
+  }
+
+  /**
+   * Gemini File APIにアップロード済みファイルのURIから文字起こし
+   * チャンクアップロード済みの大容量ファイル用
+   */
+  async transcribeFromUri(
+    fileUri: string,
+    mimeType: string
+  ): Promise<TranscriptionResult> {
+    if (!GEMINI_API_KEY) {
+      throw new Error(
+        "GEMINI_API_KEY が設定されていません。.env.local に追加してください"
+      );
+    }
+
+    return this.generateTranscription({
+      file_data: {
+        mime_type: mimeType,
+        file_uri: fileUri,
+      },
+    });
+  }
+
+  /**
+   * Gemini APIにマルチモーダルリクエストを送信して文字起こし結果を取得
+   */
+  private async generateTranscription(
+    audioPart: Record<string, unknown>
+  ): Promise<TranscriptionResult> {
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
       {

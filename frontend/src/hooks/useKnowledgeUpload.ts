@@ -164,13 +164,32 @@ export function useKnowledgeUpload() {
   return { step, error, result, nodeStatus, errorAtStep, failedNode, upload, reset };
 }
 
+const CHUNK_SIZE = 3 * 1024 * 1024; // 3MB per chunk
+const SIZE_THRESHOLD = 4 * 1024 * 1024; // 4MB — Vercel body size limit対策
+
 /**
- * メディアファイルをapi/knowledge-mediaに送って文字起こし結果を取得
+ * メディアファイルを文字起こし
+ * 小さいファイルは直接送信、大きいファイルはチャンクアップロード
  */
 async function transcribeMedia(
   file: File,
   onProgress: (msg: string) => void
 ): Promise<string> {
+  if (file.size < SIZE_THRESHOLD) {
+    return transcribeMediaDirect(file, onProgress);
+  }
+  return transcribeMediaChunked(file, onProgress);
+}
+
+/**
+ * 小さいファイル（< 4MB）: FormDataで直接送信
+ */
+async function transcribeMediaDirect(
+  file: File,
+  onProgress: (msg: string) => void
+): Promise<string> {
+  onProgress("ファイルをアップロード中...");
+
   const formData = new FormData();
   formData.append("file", file);
 
@@ -180,10 +199,124 @@ async function transcribeMedia(
   });
 
   if (!res.ok || !res.body) {
-    throw new Error("メディア処理APIの呼び出しに失敗しました");
+    const errorText = await res.text().catch(() => "");
+    throw new Error(
+      `メディア処理APIの呼び出しに失敗しました (${res.status}): ${errorText || res.statusText}`
+    );
   }
 
-  const reader = res.body.getReader();
+  return readSSEResult(res.body, onProgress);
+}
+
+/**
+ * 大きいファイル（>= 4MB）: Gemini File API経由のチャンクアップロード
+ * 1. init → uploadUrl取得
+ * 2. upload-chunk × N → チャンク送信
+ * 3. transcribe → fileUriで文字起こし
+ */
+async function transcribeMediaChunked(
+  file: File,
+  onProgress: (msg: string) => void
+): Promise<string> {
+  const mimeType = file.type || getMediaMimeType(file.name);
+
+  // Step 1: resumable upload 初期化
+  onProgress("アップロードを初期化中...");
+  const initRes = await fetch("/api/knowledge-media", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "init",
+      fileName: file.name,
+      fileSize: file.size,
+      mimeType,
+    }),
+  });
+
+  if (!initRes.ok) {
+    const errorData = await initRes
+      .json()
+      .catch(() => ({ error: initRes.statusText }));
+    throw new Error(
+      `アップロード初期化失敗: ${errorData.error || initRes.statusText}`
+    );
+  }
+
+  const { uploadUrl } = await initRes.json();
+
+  // Step 2: チャンクアップロード
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  let fileUri = "";
+
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, file.size);
+    const chunk = file.slice(start, end);
+    const isLast = i === totalChunks - 1;
+
+    onProgress(`アップロード中... (${i + 1}/${totalChunks})`);
+
+    const chunkForm = new FormData();
+    chunkForm.append("action", "upload-chunk");
+    chunkForm.append("uploadUrl", uploadUrl);
+    chunkForm.append("chunk", chunk);
+    chunkForm.append("offset", String(start));
+    chunkForm.append("isLast", String(isLast));
+
+    const chunkRes = await fetch("/api/knowledge-media", {
+      method: "POST",
+      body: chunkForm,
+    });
+
+    if (!chunkRes.ok) {
+      const errorData = await chunkRes
+        .json()
+        .catch(() => ({ error: chunkRes.statusText }));
+      throw new Error(
+        `チャンクアップロード失敗 (${i + 1}/${totalChunks}): ${errorData.error}`
+      );
+    }
+
+    if (isLast) {
+      const result = await chunkRes.json();
+      fileUri = result.fileUri;
+    }
+  }
+
+  if (!fileUri) {
+    throw new Error("ファイルURIの取得に失敗しました");
+  }
+
+  // Step 3: fileUri で文字起こし
+  onProgress("文字起こし中...");
+  const transcribeRes = await fetch("/api/knowledge-media", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "transcribe",
+      fileUri,
+      mimeType,
+    }),
+  });
+
+  if (!transcribeRes.ok || !transcribeRes.body) {
+    const errorText = await transcribeRes.text().catch(() => "");
+    throw new Error(
+      `文字起こしAPI呼び出し失敗 (${transcribeRes.status}): ${errorText || transcribeRes.statusText}`
+    );
+  }
+
+  return readSSEResult(transcribeRes.body, onProgress);
+}
+
+/**
+ * SSEストリームを読み取り、normalizedTextを返す
+ */
+async function readSSEResult(
+  body: ReadableStream<Uint8Array>,
+  onProgress: (msg: string) => void
+): Promise<string> {
+  const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let normalizedText = "";
@@ -203,7 +336,7 @@ async function transcribeMedia(
       try {
         event = JSON.parse(line.slice(6));
       } catch {
-        continue; // JSONパース失敗は無視
+        continue;
       }
 
       if (event.event === "progress") {
@@ -221,4 +354,21 @@ async function transcribeMedia(
   }
 
   return normalizedText;
+}
+
+/**
+ * ファイル名からMIMEタイプを推定（File.typeが空の場合のフォールバック）
+ */
+function getMediaMimeType(fileName: string): string {
+  const ext = fileName.substring(fileName.lastIndexOf(".")).toLowerCase();
+  const types: Record<string, string> = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+    ".ogg": "audio/ogg",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+  };
+  return types[ext] || "application/octet-stream";
 }
