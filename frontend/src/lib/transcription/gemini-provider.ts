@@ -173,9 +173,15 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
 
     const fileInfo = await uploadRes.json();
     const fileUri = fileInfo.file?.uri;
+    const fileName = fileInfo.file?.name;
 
     if (!fileUri) {
       throw new Error("Gemini File APIからファイルURIを取得できませんでした");
+    }
+
+    // ファイルが ACTIVE になるまで待機
+    if (fileName) {
+      await this.waitForFileActive(fileName);
     }
 
     return {
@@ -184,6 +190,46 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
         file_uri: fileUri,
       },
     };
+  }
+
+  /**
+   * Gemini File APIのファイルが ACTIVE 状態になるまでポーリング
+   * アップロード直後は PROCESSING 状態のため、使用前に待機が必要
+   */
+  private async waitForFileActive(fileName: string): Promise<void> {
+    const maxWaitMs = 120_000; // 最大2分
+    const pollIntervalMs = 2_000; // 2秒間隔
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < maxWaitMs) {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${GEMINI_API_KEY}`
+      );
+
+      if (!res.ok) {
+        const error = await res.text();
+        throw new Error(`ファイルステータス確認失敗: ${error}`);
+      }
+
+      const data = await res.json();
+      const state = data.state;
+
+      console.log(`[Gemini] File ${fileName} state: ${state}`);
+
+      if (state === "ACTIVE") return;
+      if (state === "FAILED") {
+        throw new Error(
+          "Gemini File APIのファイル処理に失敗しました"
+        );
+      }
+
+      // PROCESSING — 待機してリトライ
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+
+    throw new Error(
+      "ファイルのアクティベーション待ちがタイムアウトしました（2分）"
+    );
   }
 }
 
