@@ -377,9 +377,21 @@ export async function runKnowledgePipeline(
     throw new Error("QAペアが1つも生成できませんでした。");
   }
 
-  // Step 4: Database insert
+  // Step 4: Database insert (既存データがあれば置き換え)
   send({ event: "node_started", data: { title: "データベース書き込み" } });
   const project = classifyProject(mtgTitle);
+
+  // 同じMTGの既存QAデータを削除（重複防止）
+  const { error: deleteError } = await supabase
+    .from("qa_knowledge")
+    .delete()
+    .eq("mtg_title", mtgTitle)
+    .eq("mtg_date", mtgDate);
+
+  if (deleteError) {
+    console.warn("既存データ削除時の警告:", deleteError.message);
+    // 削除失敗は致命的ではないので続行（新規MTGの場合は削除対象なし）
+  }
 
   const rows = allQAPairs.map((qa) => ({
     id: randomUUID(),
@@ -402,7 +414,11 @@ export async function runKnowledgePipeline(
     .select("id, question, answer");
 
   if (insertError) {
-    throw new Error(`データベース書き込みエラー: ${insertError.message}`);
+    const msg = insertError.message || "";
+    const cleanMsg = msg.includes("<html") || msg.includes("<!DOCTYPE")
+      ? "Supabaseに接続できません（502 Bad Gateway）。Supabaseダッシュボードでプロジェクトの状態を確認してください"
+      : msg;
+    throw new Error(`データベース書き込みエラー: ${cleanMsg}`);
   }
   send({ event: "node_finished", data: { status: "succeeded", title: "データベース書き込み" } });
 
