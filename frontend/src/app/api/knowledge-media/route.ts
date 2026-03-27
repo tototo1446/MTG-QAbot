@@ -167,27 +167,58 @@ async function handleTranscribeAssembled(body: {
         }
         const fileBuffer = Buffer.concat(chunks);
 
+        const fileSizeMB = (fileBuffer.length / 1024 / 1024).toFixed(1);
         send({
           event: "progress",
           step: "transcribing",
-          message: "文字起こし中...",
+          message: `文字起こし中...（${fileSizeMB}MB、大きいファイルは数分かかります）`,
           fileSize: fileBuffer.length,
         });
 
-        // Step 2: Gemini で文字起こし
-        // gemini-provider が 15MB 超は自動で File API アップロードを行う
-        const provider = new GeminiTranscriptionProvider();
-        const result = await provider.transcribe(fileBuffer, fileName);
+        // Keep-alive: 長時間の文字起こし中にSSE接続を維持
+        const keepAlive = setInterval(() => {
+          send({
+            event: "progress",
+            step: "transcribing",
+            message: `文字起こし処理中...（${fileSizeMB}MB）`,
+          });
+        }, 15_000);
+
+        let result;
+        try {
+          // Step 2: Gemini で文字起こし
+          // gemini-provider が 15MB 超は自動で File API アップロードを行う
+          const provider = new GeminiTranscriptionProvider();
+          result = await provider.transcribe(fileBuffer, fileName);
+        } finally {
+          clearInterval(keepAlive);
+        }
+
+        if (!result.segments || result.segments.length === 0) {
+          send({
+            event: "error",
+            message: `文字起こし結果が空です。Gemini APIがセグメントを返しませんでした（ファイルサイズ: ${fileSizeMB}MB, 言語: ${result.language || "不明"}）。ファイルが長すぎるか、音声が含まれていない可能性があります。`,
+          });
+          return;
+        }
 
         send({
           event: "progress",
           step: "normalizing",
-          message: "正規化中...",
+          message: `正規化中...（${result.segments.length}セグメント）`,
           segmentCount: result.segments.length,
         });
 
         // Step 3: 正規化
         const normalized = normalizeWhisperDiarized(result.segments);
+
+        if (!normalized.normalizedText) {
+          send({
+            event: "error",
+            message: `正規化後のテキストが空です。セグメント数: ${result.segments.length}、話者数: ${normalized.speakers.length}`,
+          });
+          return;
+        }
 
         send({
           event: "result",
@@ -265,24 +296,55 @@ function handleDirectTranscribe(formData: FormData) {
 
         const fileBuffer = Buffer.from(await file.arrayBuffer());
 
+        const fileSizeMB = (fileBuffer.length / 1024 / 1024).toFixed(1);
         send({
           event: "progress",
           step: "transcribing",
-          message: "文字起こし中...",
+          message: `文字起こし中...（${fileSizeMB}MB）`,
           fileSize: fileBuffer.length,
         });
 
-        const provider = new GeminiTranscriptionProvider();
-        const result = await provider.transcribe(fileBuffer, file.name);
+        // Keep-alive: 長時間の文字起こし中にSSE接続を維持
+        const keepAlive = setInterval(() => {
+          send({
+            event: "progress",
+            step: "transcribing",
+            message: `文字起こし処理中...（${fileSizeMB}MB）`,
+          });
+        }, 15_000);
+
+        let result;
+        try {
+          const provider = new GeminiTranscriptionProvider();
+          result = await provider.transcribe(fileBuffer, file.name);
+        } finally {
+          clearInterval(keepAlive);
+        }
+
+        if (!result.segments || result.segments.length === 0) {
+          send({
+            event: "error",
+            message: `文字起こし結果が空です（ファイルサイズ: ${fileSizeMB}MB）。ファイルが長すぎるか、音声が含まれていない可能性があります。`,
+          });
+          return;
+        }
 
         send({
           event: "progress",
           step: "normalizing",
-          message: "正規化中...",
+          message: `正規化中...（${result.segments.length}セグメント）`,
           segmentCount: result.segments.length,
         });
 
         const normalized = normalizeWhisperDiarized(result.segments);
+
+        if (!normalized.normalizedText) {
+          send({
+            event: "error",
+            message: `正規化後のテキストが空です。セグメント数: ${result.segments.length}`,
+          });
+          return;
+        }
 
         send({
           event: "result",
