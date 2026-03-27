@@ -28,6 +28,16 @@ interface ParseResult {
   speakers: string[];
   lineCount: number;
   originalLineCount: number;
+  stats: TranscriptStats;
+}
+
+interface TranscriptStats {
+  droppedLineCount: number;
+  shortLineCount: number;
+  lowSignalLineCount: number;
+  averageContentLength: number;
+  lowSignalRatio: number;
+  retainedRatio: number;
 }
 
 // --- Project Classification (from backfill-projects) ---
@@ -63,11 +73,125 @@ const FILLER_REGEX = new RegExp(
 );
 const REPEAT_REGEX = /\b(\w+)\s+(\1\s+){2,}/gi;
 const CONTENT_CHARS_REGEX = /[^a-zA-Z\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]/g;
+const JAPANESE_CHAR_REGEX = /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]/;
+const TIME_RANGE_REGEX = /^(\d{1,2}:\d{2}(?::\d{2})?)/;
+
+function isLowSignalUtterance(cleaned: string, contentOnly: string): boolean {
+  const normalized = cleaned.toLowerCase();
+  const tokens = normalized
+    .split(/\s+/)
+    .map((token) => token.replace(/[^a-zA-Z\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]/g, ""))
+    .filter(Boolean);
+  const uniqueTokenCount = new Set(tokens).size;
+  const hasJapanese = JAPANESE_CHAR_REGEX.test(cleaned);
+
+  if (contentOnly.length <= 3) return true;
+  if (tokens.length >= 4 && uniqueTokenCount <= 1) return true;
+  if (!hasJapanese && tokens.length >= 5 && uniqueTokenCount <= 2) return true;
+
+  return false;
+}
+
+function parseTimestampToSeconds(timestamp: string): number {
+  const parts = timestamp.split(":").map(Number);
+  return parts.length === 3
+    ? parts[0] * 3600 + parts[1] * 60 + parts[2]
+    : parts[0] * 60 + parts[1];
+}
+
+function formatSeconds(seconds: number): string {
+  const safeSeconds = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(safeSeconds / 3600);
+  const m = Math.floor((safeSeconds % 3600) / 60);
+  const s = safeSeconds % 60;
+
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  }
+
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function extractTimeRange(content: string): string {
+  const lines = content.split("\n").filter(Boolean);
+  const firstMatch = lines[0]?.match(TIME_RANGE_REGEX);
+  const lastMatch = lines[lines.length - 1]?.match(TIME_RANGE_REGEX);
+
+  if (!firstMatch || !lastMatch) return "";
+  return `${firstMatch[1]}-${lastMatch[1]}`;
+}
+
+function buildFallbackChunks(cleaned: string, speakers: string[]): TranscriptChunk[] {
+  const lines = cleaned.split("\n").filter(Boolean);
+  if (lines.length === 0) return [];
+
+  const MAX_LINES_PER_CHUNK = 12;
+  const MAX_DURATION_SECONDS = 8 * 60;
+  const chunks: TranscriptChunk[] = [];
+  let currentLines: string[] = [];
+  let currentStart: number | null = null;
+  let currentEnd: number | null = null;
+  let chunkIndex = 1;
+
+  const flush = () => {
+    if (currentLines.length === 0) return;
+    const content = currentLines.join("\n");
+    const timeRange =
+      currentStart !== null && currentEnd !== null
+        ? `${formatSeconds(currentStart)}-${formatSeconds(currentEnd)}`
+        : extractTimeRange(content);
+
+    chunks.push({
+      topic: `暫定チャンク ${chunkIndex}`,
+      content,
+      speakers,
+      time_range: timeRange,
+    });
+
+    chunkIndex++;
+    currentLines = [];
+    currentStart = null;
+    currentEnd = null;
+  };
+
+  for (const line of lines) {
+    const match = line.match(TIMESTAMP_REGEX);
+    const timestamp = match?.[1];
+    const seconds = timestamp ? parseTimestampToSeconds(timestamp) : null;
+    const durationExceeded =
+      currentStart !== null && seconds !== null
+        ? seconds - currentStart >= MAX_DURATION_SECONDS
+        : false;
+
+    if (currentLines.length >= MAX_LINES_PER_CHUNK || durationExceeded) {
+      flush();
+    }
+
+    currentLines.push(line);
+    if (seconds !== null) {
+      if (currentStart === null) currentStart = seconds;
+      currentEnd = seconds;
+    }
+  }
+
+  flush();
+  return chunks;
+}
+
+function buildChunkingFailureMessage(stats: TranscriptStats): string {
+  const retainedPercent = Math.round(stats.retainedRatio * 100);
+  const lowSignalPercent = Math.round(stats.lowSignalRatio * 100);
+
+  return `チャンク分割の結果が空です。文字起こし品質が低く、有意義な内容として抽出できなかった可能性があります。解析後の残存率: ${retainedPercent}% (${stats.droppedLineCount}行除外)、低シグナル率: ${lowSignalPercent}%、平均発話長: ${stats.averageContentLength.toFixed(1)}文字。`;
+}
 
 export function parseTranscript(text: string): ParseResult {
   const lines = text.trim().split("\n");
   const parsedLines: string[] = [];
   const speakersSet = new Set<string>();
+  let shortLineCount = 0;
+  let lowSignalLineCount = 0;
+  let totalContentLength = 0;
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -88,18 +212,40 @@ export function parseTranscript(text: string): ParseResult {
 
       // Skip lines with too little meaningful content
       const contentOnly = cleaned.replace(CONTENT_CHARS_REGEX, "");
-      if (!contentOnly || contentOnly.length < 2) continue;
+      if (!contentOnly || contentOnly.length < 2) {
+        shortLineCount++;
+        continue;
+      }
+      if (isLowSignalUtterance(cleaned, contentOnly)) {
+        lowSignalLineCount++;
+        continue;
+      }
 
       speakersSet.add(speaker);
       parsedLines.push(`${timestamp} ${speaker}: ${cleaned}`);
+      totalContentLength += contentOnly.length;
     }
   }
+
+  const lineCount = parsedLines.length;
+  const droppedLineCount = Math.max(0, lines.length - lineCount);
+  const averageContentLength = lineCount > 0 ? totalContentLength / lineCount : 0;
+  const lowSignalRatio = lineCount > 0 ? lowSignalLineCount / (lineCount + lowSignalLineCount) : 0;
+  const retainedRatio = lines.length > 0 ? lineCount / lines.length : 0;
 
   return {
     cleaned: parsedLines.join("\n"),
     speakers: [...speakersSet].sort(),
-    lineCount: parsedLines.length,
+    lineCount,
     originalLineCount: lines.length,
+    stats: {
+      droppedLineCount,
+      shortLineCount,
+      lowSignalLineCount,
+      averageContentLength,
+      lowSignalRatio,
+      retainedRatio,
+    },
   };
 }
 
@@ -346,17 +492,32 @@ export async function runKnowledgePipeline(
     parsed.originalLineCount
   );
 
-  if (chunks.length === 0) {
-    throw new Error("チャンク分割の結果が空です。有意義な内容が見つかりませんでした。");
+  const effectiveChunks =
+    chunks.length > 0 ? chunks : buildFallbackChunks(parsed.cleaned, parsed.speakers);
+
+  if (chunks.length === 0 && effectiveChunks.length > 0) {
+    send({
+      event: "node_finished",
+      data: {
+        status: "warning",
+        title: "チャンク分割",
+        error:
+          "LLMのチャンク分割結果が空だったため、時間帯ベースの簡易チャンクにフォールバックしました。",
+      },
+    });
+  }
+
+  if (effectiveChunks.length === 0) {
+    throw new Error(buildChunkingFailureMessage(parsed.stats));
   }
   send({ event: "node_finished", data: { status: "succeeded", title: "チャンク分割" } });
 
   // Step 3: QA generation per chunk
   const allQAPairs: (QAPair & { topic: string; time_range: string })[] = [];
-  const totalChunks = chunks.length;
+  const totalChunks = effectiveChunks.length;
 
   for (let i = 0; i < totalChunks; i++) {
-    const chunk = chunks[i];
+    const chunk = effectiveChunks[i];
     const stepTitle = `QA生成 (${i + 1}/${totalChunks}): ${chunk.topic}`;
     send({ event: "node_started", data: { title: stepTitle } });
 
@@ -435,7 +596,7 @@ export async function runKnowledgePipeline(
     data: {
       status: "succeeded",
       outputs: {
-        chunk_count: chunks.length,
+        chunk_count: effectiveChunks.length,
         qa_count: allQAPairs.length,
         summary,
       },
