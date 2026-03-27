@@ -591,6 +591,19 @@ export async function runKnowledgePipeline(
   send({ event: "node_finished", data: { status: "succeeded", title: "Embedding生成" } });
 
   // Step 6: Complete
+  const qaData = rows.map((r) => ({
+    mtg_title: r.mtg_title,
+    mtg_date: r.mtg_date,
+    topic: r.topic,
+    time_range: r.time_range,
+    question: r.question,
+    answer: r.answer,
+    fixed_tags: r.fixed_tags,
+    free_tags: r.free_tags,
+    speaker: r.speaker,
+    project: r.project,
+  }));
+
   send({
     event: "workflow_finished",
     data: {
@@ -599,6 +612,7 @@ export async function runKnowledgePipeline(
         chunk_count: effectiveChunks.length,
         qa_count: allQAPairs.length,
         summary,
+        qa_data: qaData,
       },
     },
   });

@@ -1,7 +1,7 @@
 "use client";
 
 import { cn } from "@/lib/utils";
-import { Check, Loader2, AlertCircle, Upload, Cpu, CheckCircle2 } from "lucide-react";
+import { Check, Loader2, AlertCircle, Upload, Cpu, CheckCircle2, Download } from "lucide-react";
 import type { UploadStep } from "@/types";
 
 interface ProgressTrackerProps {
@@ -14,6 +14,18 @@ interface ProgressTrackerProps {
     chunkCount?: number;
     qaCount?: number;
     results?: string;
+    qaData?: Array<{
+      mtg_title: string;
+      mtg_date: string;
+      topic: string;
+      time_range: string;
+      question: string;
+      answer: string;
+      fixed_tags: string;
+      free_tags: string;
+      speaker: string;
+      project: string;
+    }>;
   };
 }
 
@@ -39,6 +51,47 @@ function getStepState(stepKey: string, currentStep: UploadStep, errorAtStep?: "u
   if (stepIndex < currentIndex) return "done";
   if (stepIndex === currentIndex) return "active";
   return "pending";
+}
+
+function escapeCsvField(value: string): string {
+  if (value.includes(",") || value.includes('"') || value.includes("\n")) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
+}
+
+function downloadCsv(qaData: NonNullable<ProgressTrackerProps["result"]>["qaData"]) {
+  if (!qaData || qaData.length === 0) return;
+
+  const headers = ["MTGタイトル", "MTG日付", "トピック", "時間帯", "質問", "回答", "固定タグ", "自由タグ", "話者", "プロジェクト"];
+  const csvRows = [
+    headers.join(","),
+    ...qaData.map((row) =>
+      [
+        row.mtg_title,
+        row.mtg_date,
+        row.topic,
+        row.time_range,
+        row.question,
+        row.answer,
+        row.fixed_tags,
+        row.free_tags,
+        row.speaker,
+        row.project,
+      ]
+        .map(escapeCsvField)
+        .join(",")
+    ),
+  ];
+
+  const bom = "\uFEFF";
+  const blob = new Blob([bom + csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `QA_${qaData[0].mtg_title}_${qaData[0].mtg_date}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 export default function ProgressTracker({ currentStep, error, nodeStatus, errorAtStep, failedNode, result }: ProgressTrackerProps) {
@@ -149,6 +202,15 @@ export default function ProgressTracker({ currentStep, error, nodeStatus, errorA
             <p className="text-sm text-emerald-600 dark:text-emerald-400">
               生成されたQAペア数: <span className="font-semibold">{result.qaCount}</span>
             </p>
+          )}
+          {result.qaData && result.qaData.length > 0 && (
+            <button
+              onClick={() => downloadCsv(result.qaData)}
+              className="mt-3 inline-flex items-center gap-2 rounded-lg border border-emerald-300 bg-white px-4 py-2 text-sm font-medium text-emerald-700 transition-colors hover:bg-emerald-50 dark:border-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300 dark:hover:bg-emerald-900/50"
+            >
+              <Download size={16} />
+              CSVダウンロード
+            </button>
           )}
         </div>
       )}

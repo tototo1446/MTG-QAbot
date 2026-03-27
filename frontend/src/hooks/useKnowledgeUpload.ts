@@ -3,10 +3,24 @@
 import { useState, useCallback } from "react";
 import type { UploadStep, KnowledgeInputMode } from "@/types";
 
+interface QADataRow {
+  mtg_title: string;
+  mtg_date: string;
+  topic: string;
+  time_range: string;
+  question: string;
+  answer: string;
+  fixed_tags: string;
+  free_tags: string;
+  speaker: string;
+  project: string;
+}
+
 interface UploadResult {
   chunkCount?: number;
   qaCount?: number;
   results?: string;
+  qaData?: QADataRow[];
 }
 
 export function useKnowledgeUpload() {
@@ -118,6 +132,7 @@ export function useKnowledgeUpload() {
                   chunkCount: event.data?.outputs?.chunk_count,
                   qaCount: event.data?.outputs?.qa_count,
                   results: event.data?.outputs?.results,
+                  qaData: event.data?.outputs?.qa_data,
                 });
                 setNodeStatus("");
                 setStep("completed");
