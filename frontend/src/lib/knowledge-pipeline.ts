@@ -193,36 +193,67 @@ export function parseTranscript(text: string): ParseResult {
   let lowSignalLineCount = 0;
   let totalContentLength = 0;
 
+  // Timestamp without speaker: "39:33 テキスト内容"
+  const TIMESTAMP_NOSPEAKER_REGEX = /^(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)$/;
+
+  // --- Pass 1: Try timestamp-based formats ---
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (!line) continue;
 
-    const match = line.match(TIMESTAMP_REGEX);
-    if (match) {
-      const timestamp = match[1];
-      const speaker = match[2].trim();
-      let cleaned = match[3].trim();
-
-      // Filler removal
+    // Format A: "0:00 Speaker: text"
+    const fullMatch = line.match(TIMESTAMP_REGEX);
+    if (fullMatch) {
+      const timestamp = fullMatch[1];
+      const speaker = fullMatch[2].trim();
+      let cleaned = fullMatch[3].trim();
       cleaned = cleaned.replace(FILLER_REGEX, " ");
-      // Repeat phrase removal
       cleaned = cleaned.replace(REPEAT_REGEX, "$1 ");
-      // Normalize whitespace
       cleaned = cleaned.replace(/\s+/g, " ").trim();
-
-      // Skip lines with too little meaningful content
       const contentOnly = cleaned.replace(CONTENT_CHARS_REGEX, "");
-      if (!contentOnly || contentOnly.length < 2) {
-        shortLineCount++;
-        continue;
-      }
-      if (isLowSignalUtterance(cleaned, contentOnly)) {
-        lowSignalLineCount++;
-        continue;
-      }
-
+      if (!contentOnly || contentOnly.length < 2) { shortLineCount++; continue; }
+      if (isLowSignalUtterance(cleaned, contentOnly)) { lowSignalLineCount++; continue; }
       speakersSet.add(speaker);
       parsedLines.push(`${timestamp} ${speaker}: ${cleaned}`);
+      totalContentLength += contentOnly.length;
+      continue;
+    }
+
+    // Format B: "0:00 text" (no speaker)
+    const tsMatch = line.match(TIMESTAMP_NOSPEAKER_REGEX);
+    if (tsMatch) {
+      const timestamp = tsMatch[1];
+      let cleaned = tsMatch[2].trim();
+      cleaned = cleaned.replace(FILLER_REGEX, " ");
+      cleaned = cleaned.replace(REPEAT_REGEX, "$1 ");
+      cleaned = cleaned.replace(/\s+/g, " ").trim();
+      const contentOnly = cleaned.replace(CONTENT_CHARS_REGEX, "");
+      if (!contentOnly || contentOnly.length < 2) { shortLineCount++; continue; }
+      if (isLowSignalUtterance(cleaned, contentOnly)) { lowSignalLineCount++; continue; }
+      speakersSet.add("不明");
+      parsedLines.push(`${timestamp} 不明: ${cleaned}`);
+      totalContentLength += contentOnly.length;
+    }
+  }
+
+  // --- Pass 2: Plain text fallback (no timestamps at all) ---
+  if (parsedLines.length === 0) {
+    shortLineCount = 0;
+    lowSignalLineCount = 0;
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      let cleaned = line;
+      cleaned = cleaned.replace(FILLER_REGEX, " ");
+      cleaned = cleaned.replace(REPEAT_REGEX, "$1 ");
+      cleaned = cleaned.replace(/\s+/g, " ").trim();
+      if (!cleaned) continue;
+      const contentOnly = cleaned.replace(CONTENT_CHARS_REGEX, "");
+      if (!contentOnly || contentOnly.length < 2) { shortLineCount++; continue; }
+      if (isLowSignalUtterance(cleaned, contentOnly)) { lowSignalLineCount++; continue; }
+      speakersSet.add("不明");
+      parsedLines.push(cleaned);
       totalContentLength += contentOnly.length;
     }
   }
@@ -477,7 +508,7 @@ export async function runKnowledgePipeline(
   const parsed = parseTranscript(text);
 
   if (parsed.lineCount === 0) {
-    throw new Error("有効な行がありません。タイムスタンプ付きの文字起こしテキストを入力してください。");
+    throw new Error("有効な行がありません。テキストの内容が短すぎるか、意味のある内容が含まれていない可能性があります。");
   }
   send({ event: "node_finished", data: { status: "succeeded", title: "テキスト解析" } });
 
