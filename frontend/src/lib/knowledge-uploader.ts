@@ -1,0 +1,367 @@
+import type { UploadStep, KnowledgeInputMode } from "@/types";
+
+export interface QADataRow {
+  mtg_title: string;
+  mtg_date: string;
+  topic: string;
+  time_range: string;
+  question: string;
+  answer: string;
+  fixed_tags: string;
+  free_tags: string;
+  speaker: string;
+  project: string;
+}
+
+export interface UploadResult {
+  chunkCount?: number;
+  qaCount?: number;
+  results?: string;
+  qaData?: QADataRow[];
+}
+
+export interface KnowledgeUploadEvents {
+  onStep: (step: UploadStep) => void;
+  onNodeStatus: (message: string) => void;
+  onResult: (result: UploadResult) => void;
+  onError: (
+    message: string,
+    atStep: "uploading" | "processing",
+    failedNode?: string
+  ) => void;
+}
+
+export interface KnowledgeUploadParams {
+  input: File | string;
+  mode: KnowledgeInputMode;
+  mtgTitle: string;
+  mtgDate: string;
+}
+
+export async function runKnowledgeUpload(
+  { input, mode, mtgTitle, mtgDate }: KnowledgeUploadParams,
+  events: KnowledgeUploadEvents
+): Promise<void> {
+  let activeStep: "uploading" | "processing" = "uploading";
+  let lastFailedNodeTitle: string | undefined;
+  let lastFailedNodeError: string | undefined;
+
+  try {
+    events.onStep("uploading");
+
+    let normalizedText: string | null = null;
+
+    if (mode === "media" && input instanceof File) {
+      events.onNodeStatus("音声/動画を処理中...");
+      normalizedText = await transcribeMedia(input, (msg) =>
+        events.onNodeStatus(msg)
+      );
+    }
+
+    const formData = new FormData();
+    formData.append("mtg_title", mtgTitle);
+    formData.append("mtg_date", mtgDate);
+
+    if (mode === "file" && input instanceof File) {
+      formData.append("mode", "file");
+      formData.append("file", input);
+    } else if (mode === "text" && typeof input === "string") {
+      formData.append("mode", "text");
+      formData.append("text", input);
+    } else if (mode === "media" && normalizedText) {
+      formData.append("mode", "text");
+      formData.append("text", normalizedText);
+    }
+
+    const res = await fetch("/api/knowledge", {
+      method: "POST",
+      body: formData,
+    });
+
+    const contentType = res.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const data = await res.json();
+      throw new Error(data.error || "アップロードに失敗しました");
+    }
+
+    if (!res.ok || !res.body) {
+      throw new Error("ストリームの取得に失敗しました");
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let terminated = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+
+        let event;
+        try {
+          event = JSON.parse(line.slice(6));
+        } catch {
+          continue;
+        }
+
+        if (event.event === "file_uploaded") {
+          activeStep = "processing";
+          events.onStep("processing");
+          events.onNodeStatus("ワークフロー開始中...");
+        } else if (event.event === "node_finished") {
+          if (event.data?.status === "failed") {
+            lastFailedNodeTitle = (event.data?.title as string) || undefined;
+            lastFailedNodeError = (event.data?.error as string) || undefined;
+          }
+        } else if (event.event === "node_started") {
+          events.onNodeStatus(event.data?.title || "処理中...");
+        } else if (event.event === "workflow_finished") {
+          if (event.data?.status === "succeeded") {
+            events.onResult({
+              chunkCount: event.data?.outputs?.chunk_count,
+              qaCount: event.data?.outputs?.qa_count,
+              results: event.data?.outputs?.results,
+              qaData: event.data?.outputs?.qa_data,
+            });
+            events.onNodeStatus("");
+            events.onStep("completed");
+            terminated = true;
+          } else {
+            const baseMsg = event.data?.error || "ワークフローが失敗しました";
+            const detail = lastFailedNodeTitle
+              ? `ノード「${lastFailedNodeTitle}」で失敗しました${
+                  lastFailedNodeError ? `: ${lastFailedNodeError}` : ""
+                }`
+              : baseMsg;
+            terminated = true;
+            throw new Error(detail as string);
+          }
+        } else if (event.event === "error") {
+          terminated = true;
+          throw new Error(
+            event.data?.message ||
+              event.message ||
+              "ワークフローでエラーが発生しました"
+          );
+        }
+      }
+    }
+
+    // ストリームが workflow_finished / error を送らずに切断された場合
+    // （Vercel function timeout など）を検知してエラー扱いにする
+    if (!terminated) {
+      throw new Error(
+        "処理が途中で中断されました（サーバー側のタイムアウトの可能性があります）"
+      );
+    }
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "不明なエラーが発生しました";
+    events.onError(message, activeStep, lastFailedNodeTitle);
+    events.onStep("error");
+    events.onNodeStatus("");
+  }
+}
+
+// --- Media transcription helpers ---
+
+const CHUNK_SIZE = 3 * 1024 * 1024;
+const SIZE_THRESHOLD = 4 * 1024 * 1024;
+
+async function transcribeMedia(
+  file: File,
+  onProgress: (msg: string) => void
+): Promise<string> {
+  if (file.size < SIZE_THRESHOLD) {
+    return transcribeMediaDirect(file, onProgress);
+  }
+  return transcribeMediaChunked(file, onProgress);
+}
+
+async function transcribeMediaDirect(
+  file: File,
+  onProgress: (msg: string) => void
+): Promise<string> {
+  onProgress("ファイルをアップロード中...");
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const res = await fetch("/api/knowledge-media", {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok || !res.body) {
+    const errorText = await res.text().catch(() => "");
+    throw new Error(
+      `メディア処理APIの呼び出しに失敗しました (${res.status}): ${
+        errorText || res.statusText
+      }`
+    );
+  }
+
+  return readSSEResult(res.body, onProgress);
+}
+
+async function transcribeMediaChunked(
+  file: File,
+  onProgress: (msg: string) => void
+): Promise<string> {
+  const sessionId = crypto.randomUUID();
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+  for (let i = 0; i < totalChunks; i++) {
+    await sendChunk(file, sessionId, i, totalChunks, onProgress);
+  }
+
+  const mimeType = file.type || getMediaMimeType(file.name);
+  const MAX_RETRIES = 5;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    onProgress(attempt > 0 ? "不足チャンクを再送中..." : "文字起こし中...");
+
+    const res = await fetch("/api/knowledge-media", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "transcribe-assembled",
+        sessionId,
+        fileName: file.name,
+        mimeType,
+        totalParts: totalChunks,
+      }),
+    });
+
+    if (res.status === 409) {
+      const data = await res.json();
+      const missing: number[] = data.missingIndices || [];
+
+      if (attempt >= MAX_RETRIES) {
+        throw new Error(
+          `チャンクアップロードに失敗しました（${missing.length}個が不足）`
+        );
+      }
+
+      onProgress(`不足チャンクを再送中... (${missing.length}個)`);
+      for (const idx of missing) {
+        await sendChunk(file, sessionId, idx, totalChunks, onProgress);
+      }
+      continue;
+    }
+
+    if (!res.ok || !res.body) {
+      const errorText = await res.text().catch(() => "");
+      throw new Error(
+        `文字起こしAPI呼び出し失敗 (${res.status}): ${
+          errorText || res.statusText
+        }`
+      );
+    }
+
+    return readSSEResult(res.body, onProgress);
+  }
+
+  throw new Error("最大リトライ回数を超えました");
+}
+
+async function sendChunk(
+  file: File,
+  sessionId: string,
+  index: number,
+  totalChunks: number,
+  onProgress: (msg: string) => void
+): Promise<void> {
+  const start = index * CHUNK_SIZE;
+  const end = Math.min(start + CHUNK_SIZE, file.size);
+  const chunk = file.slice(start, end);
+
+  onProgress(`アップロード中... (${index + 1}/${totalChunks})`);
+
+  const formData = new FormData();
+  formData.append("action", "upload-part");
+  formData.append("sessionId", sessionId);
+  formData.append("index", String(index));
+  formData.append("chunk", chunk);
+
+  const res = await fetch("/api/knowledge-media", {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const errorData = await res
+      .json()
+      .catch(() => ({ error: res.statusText }));
+    throw new Error(
+      `チャンクアップロード失敗 (${index + 1}/${totalChunks}): ${
+        errorData.error
+      }`
+    );
+  }
+}
+
+async function readSSEResult(
+  body: ReadableStream<Uint8Array>,
+  onProgress: (msg: string) => void
+): Promise<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let normalizedText = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+
+      let event;
+      try {
+        event = JSON.parse(line.slice(6));
+      } catch {
+        continue;
+      }
+
+      if (event.event === "progress") {
+        onProgress(event.message || "処理中...");
+      } else if (event.event === "result") {
+        normalizedText = event.normalizedText;
+      } else if (event.event === "error") {
+        throw new Error(event.message || "メディア処理エラー");
+      }
+    }
+  }
+
+  if (!normalizedText) {
+    throw new Error("文字起こし結果が空です");
+  }
+
+  return normalizedText;
+}
+
+function getMediaMimeType(fileName: string): string {
+  const ext = fileName.substring(fileName.lastIndexOf(".")).toLowerCase();
+  const types: Record<string, string> = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+    ".ogg": "audio/ogg",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+  };
+  return types[ext] || "application/octet-stream";
+}

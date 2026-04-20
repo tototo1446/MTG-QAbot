@@ -8,16 +8,21 @@ export async function POST(request: NextRequest) {
     const formData = await request.formData();
     const file = formData.get("file") as File | null;
     const text = formData.get("text") as string | null;
-    const mtgTitle = formData.get("mtg_title") as string | null;
-    const mtgDate = formData.get("mtg_date") as string | null;
+    const rawTitle = (formData.get("mtg_title") as string | null)?.trim() || "";
+    const rawDate = (formData.get("mtg_date") as string | null)?.trim() || "";
     const mode = (formData.get("mode") as string) || "file";
 
-    if (!mtgTitle || !mtgDate) {
-      return NextResponse.json(
-        { error: "MTGタイトルとMTG日付は必須です" },
-        { status: 400 }
-      );
-    }
+    const todayJst = () => {
+      const now = new Date();
+      const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+      return jst.toISOString().slice(0, 10);
+    };
+    const stripExtension = (name: string) => name.replace(/\.[^./\\]+$/, "");
+
+    const mtgDate = rawDate || todayJst();
+    const mtgTitle =
+      rawTitle ||
+      (file?.name ? stripExtension(file.name) : `テキスト入力_${mtgDate}`);
 
     // Extract transcript text
     let transcriptText: string;

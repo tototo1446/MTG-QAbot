@@ -6,6 +6,86 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_LLM_MODEL = "gemini-2.5-flash";
 const EMBEDDING_BATCH_SIZE = 100;
 
+// QA生成の並列度（Gemini 2.5 FlashのRPM制限を考慮して6に設定）
+const QA_CONCURRENCY = 6;
+// Gemini fetch のタイムアウト（ミリ秒）
+const GEMINI_FETCH_TIMEOUT_MS = 60_000;
+// リトライ最大回数（初回 + リトライN回）
+const GEMINI_MAX_RETRIES = 2;
+
+/**
+ * AbortSignal付きfetch + 指数バックオフリトライ
+ * 5xx / 429 / ネットワーク瞬断 / タイムアウトで最大 GEMINI_MAX_RETRIES 回リトライ
+ */
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  opts: { timeoutMs?: number; maxRetries?: number } = {}
+): Promise<Response> {
+  const timeoutMs = opts.timeoutMs ?? GEMINI_FETCH_TIMEOUT_MS;
+  const maxRetries = opts.maxRetries ?? GEMINI_MAX_RETRIES;
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...init, signal: controller.signal });
+      clearTimeout(timer);
+      // リトライ対象のステータス
+      if (res.status >= 500 || res.status === 429) {
+        if (attempt < maxRetries) {
+          const delay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+      }
+      return res;
+    } catch (err) {
+      clearTimeout(timer);
+      lastError = err;
+      const isAbort =
+        err instanceof Error &&
+        (err.name === "AbortError" || err.message.includes("aborted"));
+      if (attempt < maxRetries) {
+        const delay = 1000 * Math.pow(2, attempt);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      if (isAbort) {
+        throw new Error(
+          `Gemini API タイムアウト（${timeoutMs / 1000}秒×${maxRetries + 1}回失敗）`
+        );
+      }
+      throw err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("fetch 失敗");
+}
+
+/**
+ * 最大同時実行数を制限して items を fn で並列処理（プロマイスプール）
+ */
+async function runPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (cursor < items.length) {
+        const idx = cursor++;
+        results[idx] = await fn(items[idx], idx);
+      }
+    }
+  );
+  await Promise.all(workers);
+  return results;
+}
+
 // --- Types ---
 
 interface TranscriptChunk {
@@ -326,7 +406,7 @@ MTGタイトル: ${mtgTitle}
 
 ${cleaned}`;
 
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_LLM_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
     {
       method: "POST",
@@ -337,10 +417,11 @@ ${cleaned}`;
         generationConfig: {
           temperature: 0.3,
           responseMimeType: "application/json",
-          maxOutputTokens: 65536,
+          maxOutputTokens: 32768,
         },
       }),
-    }
+    },
+    { timeoutMs: 90_000 }
   );
 
   if (!res.ok) {
@@ -403,7 +484,7 @@ async function generateQAPairs(chunkJson: string): Promise<QAPair[]> {
 
 {"qa_pairs": [{"question": "質問文", "answer": "回答文", "fixed_tags": ["タグ1"], "free_tags": ["キーワード1"], "speaker": "話者名"}]}`;
 
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_LLM_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
     {
       method: "POST",
@@ -414,10 +495,11 @@ async function generateQAPairs(chunkJson: string): Promise<QAPair[]> {
         generationConfig: {
           temperature: 0.4,
           responseMimeType: "application/json",
-          maxOutputTokens: 65536,
+          maxOutputTokens: 16384,
         },
       }),
-    }
+    },
+    { timeoutMs: 60_000 }
   );
 
   if (!res.ok) {
@@ -449,17 +531,21 @@ async function generateEmbeddings(
     const batch = rows.slice(i, i + EMBEDDING_BATCH_SIZE);
     const texts = batch.map((r) => `${r.question} ${r.answer}`);
 
-    const embRes = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
+    const embRes = await fetchWithRetry(
+      "https://api.openai.com/v1/embeddings",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "text-embedding-3-small",
+          input: texts,
+        }),
       },
-      body: JSON.stringify({
-        model: "text-embedding-3-small",
-        input: texts,
-      }),
-    });
+      { timeoutMs: 45_000 }
+    );
 
     if (!embRes.ok) {
       const errText = await embRes.text();
@@ -543,27 +629,50 @@ export async function runKnowledgePipeline(
   }
   send({ event: "node_finished", data: { status: "succeeded", title: "チャンク分割" } });
 
-  // Step 3: QA generation per chunk
+  // Step 3: QA generation per chunk（並列実行）
   const allQAPairs: (QAPair & { topic: string; time_range: string })[] = [];
   const totalChunks = effectiveChunks.length;
+  let completedCount = 0;
+  let failedCount = 0;
 
-  for (let i = 0; i < totalChunks; i++) {
-    const chunk = effectiveChunks[i];
-    const stepTitle = `QA生成 (${i + 1}/${totalChunks}): ${chunk.topic}`;
-    send({ event: "node_started", data: { title: stepTitle } });
+  send({
+    event: "node_started",
+    data: { title: `QA生成中 (0/${totalChunks})` },
+  });
 
+  await runPool(effectiveChunks, QA_CONCURRENCY, async (chunk, idx) => {
+    const chunkTitle = `QA生成 [${idx + 1}]: ${chunk.topic}`;
     try {
       const qaPairs = await generateQAPairs(JSON.stringify(chunk));
       for (const qa of qaPairs) {
-        allQAPairs.push({ ...qa, topic: chunk.topic, time_range: chunk.time_range });
+        allQAPairs.push({
+          ...qa,
+          topic: chunk.topic,
+          time_range: chunk.time_range,
+        });
       }
-      send({ event: "node_finished", data: { status: "succeeded", title: stepTitle } });
+      completedCount++;
+      send({
+        event: "node_finished",
+        data: { status: "succeeded", title: chunkTitle },
+      });
     } catch (err) {
+      failedCount++;
       const errorMsg = err instanceof Error ? err.message : "不明なエラー";
-      send({ event: "node_finished", data: { status: "failed", title: stepTitle, error: errorMsg } });
+      send({
+        event: "node_finished",
+        data: { status: "failed", title: chunkTitle, error: errorMsg },
+      });
       // Skip failed chunk and continue
     }
-  }
+    // 進捗を定期送信（フロントに残り状況を見せる）
+    send({
+      event: "node_started",
+      data: {
+        title: `QA生成中 (${completedCount + failedCount}/${totalChunks} 完了, 失敗 ${failedCount})`,
+      },
+    });
+  });
 
   if (allQAPairs.length === 0) {
     throw new Error("QAペアが1つも生成できませんでした。");
