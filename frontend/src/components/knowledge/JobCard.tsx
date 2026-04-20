@@ -20,6 +20,7 @@ interface JobCardProps {
   onRemove: (id: string) => void;
   onTitleChange: (id: string, value: string) => void;
   onDateChange: (id: string, value: string) => void;
+  onTextChange?: (id: string, value: string) => void;
   disabled?: boolean;
 }
 
@@ -95,6 +96,7 @@ export default function JobCard({
   onRemove,
   onTitleChange,
   onDateChange,
+  onTextChange,
   disabled,
 }: JobCardProps) {
   const isActive = job.step === "uploading" || job.step === "processing";
@@ -158,37 +160,54 @@ export default function JobCard({
             <AlertCircle size={16} />
           ) : isIdle ? (
             <Clock size={16} />
-          ) : (
+          ) : job.kind === "file" ? (
             renderFileIcon(job.file.name)
+          ) : (
+            <FileText size={16} />
           )}
         </div>
 
         <div className="flex-1 min-w-0 space-y-2">
           <div className="flex items-center gap-2">
             <p className="text-sm font-medium text-gray-900 dark:text-white truncate flex-1">
-              {job.file.name}
+              {job.kind === "file" ? job.file.name : job.title}
             </p>
-            <span className="text-xs text-gray-500 dark:text-gray-400 shrink-0">
-              {formatSize(job.file.size)}
-            </span>
+            {job.kind === "file" && (
+              <span className="text-xs text-gray-500 dark:text-gray-400 shrink-0">
+                {formatSize(job.file.size)}
+              </span>
+            )}
           </div>
 
           {isIdle && !disabled && (
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto]">
-              <input
-                type="text"
-                value={job.title}
-                onChange={(e) => onTitleChange(job.id, e.target.value)}
-                placeholder="MTGタイトル"
-                className="w-full rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900 placeholder:text-gray-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500/30 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-              />
-              <input
-                type="date"
-                value={job.date}
-                onChange={(e) => onDateChange(job.id, e.target.value)}
-                className="rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500/30 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-              />
-            </div>
+            <>
+              {job.kind === "text" && onTextChange && (
+                <textarea
+                  value={job.text}
+                  onChange={(e) => onTextChange(job.id, e.target.value)}
+                  placeholder={
+                    "MTGの議事録やメモをここに貼り付けてください...\n\n例:\n0:00 田中: 今日は企画会議です\n0:15 鈴木: 新しい動画のネタについて話しましょう"
+                  }
+                  className="w-full rounded-md border border-gray-300 bg-white p-3 text-sm text-gray-900 placeholder:text-gray-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500/30 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+                  rows={6}
+                />
+              )}
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto]">
+                <input
+                  type="text"
+                  value={job.title}
+                  onChange={(e) => onTitleChange(job.id, e.target.value)}
+                  placeholder="MTGタイトル"
+                  className="w-full rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900 placeholder:text-gray-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500/30 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+                />
+                <input
+                  type="date"
+                  value={job.date}
+                  onChange={(e) => onDateChange(job.id, e.target.value)}
+                  className="rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500/30 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+                />
+              </div>
+            </>
           )}
 
           {!isIdle && (

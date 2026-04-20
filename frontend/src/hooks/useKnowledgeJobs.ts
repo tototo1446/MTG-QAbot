@@ -7,12 +7,10 @@ import {
 } from "@/lib/knowledge-uploader";
 import type { UploadStep } from "@/types";
 
-export type JobMode = "file" | "media";
+export type FileJobMode = "file" | "media";
 
-export interface KnowledgeJob {
+interface JobCommon {
   id: string;
-  file: File;
-  mode: JobMode;
   title: string;
   date: string;
   step: UploadStep;
@@ -23,7 +21,21 @@ export interface KnowledgeJob {
   result?: UploadResult;
 }
 
+export interface FileJob extends JobCommon {
+  kind: "file";
+  mode: FileJobMode;
+  file: File;
+}
+
+export interface TextJob extends JobCommon {
+  kind: "text";
+  text: string;
+}
+
+export type KnowledgeJob = FileJob | TextJob;
+
 const MAX_CONCURRENCY = 10;
+export const MAX_TEXT_SLOTS = 10;
 
 const stripExtension = (name: string) => name.replace(/\.[^./\\]+$/, "");
 
@@ -33,10 +45,33 @@ const todayJst = () => {
   return jst.toISOString().slice(0, 10);
 };
 
+// HHMMSSmmm + ランダム英数 — 並列実行でのキー衝突を避けるため
+// ミリ秒精度 + 短いランダムサフィックスで一意化する
+const uniqueTimeSuffix = () => {
+  const jst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const hhmmssMs = jst.toISOString().slice(11, 23).replace(/[:.]/g, "");
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `${hhmmssMs}${rand}`;
+};
+
 const createId = () =>
   typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
     : `job-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+/** セッション内のキー衝突を避けるため、重複があれば "(2)" 等のサフィックスを付与 */
+const uniquifyTitle = (base: string, date: string, taken: Set<string>) => {
+  const key = (t: string) => `${t}__${date}`;
+  if (!taken.has(key(base))) {
+    taken.add(key(base));
+    return base;
+  }
+  let i = 2;
+  while (taken.has(key(`${base} (${i})`))) i++;
+  const finalTitle = `${base} (${i})`;
+  taken.add(key(finalTitle));
+  return finalTitle;
+};
 
 export function useKnowledgeJobs() {
   const [jobs, setJobs] = useState<KnowledgeJob[]>([]);
@@ -45,27 +80,97 @@ export function useKnowledgeJobs() {
   jobsRef.current = jobs;
 
   const patchJob = useCallback(
-    (id: string, patch: Partial<KnowledgeJob>) => {
+    (id: string, patch: Partial<JobCommon>) => {
       setJobs((prev) =>
-        prev.map((job) => (job.id === id ? { ...job, ...patch } : job))
+        prev.map((job) =>
+          job.id === id ? ({ ...job, ...patch } as KnowledgeJob) : job
+        )
       );
     },
     []
   );
 
   const addFiles = useCallback(
-    (files: File[], mode: JobMode, sharedTitle = "", sharedDate = "") => {
-      const fallbackDate = sharedDate || todayJst();
-      const newJobs: KnowledgeJob[] = files.map((file) => ({
-        id: createId(),
-        file,
-        mode,
-        title: sharedTitle || stripExtension(file.name),
-        date: fallbackDate,
-        step: "idle",
-        nodeStatus: "",
-      }));
-      setJobs((prev) => [...prev, ...newJobs]);
+    (
+      files: File[],
+      mode: FileJobMode,
+      sharedTitle = "",
+      sharedDate = ""
+    ) => {
+      const effectiveDate = sharedDate || todayJst();
+      const sharedBase = sharedTitle.trim();
+
+      setJobs((prev) => {
+        // 既存ジョブのtitle+dateを taken に登録（セッション内の重複回避）
+        const taken = new Set<string>(
+          prev.map((j) => `${j.title}__${j.date}`)
+        );
+
+        const newJobs: FileJob[] = files.map((file) => {
+          const fileBase = stripExtension(file.name);
+          // 共通titleが入っている場合はそれをベースにしつつ、
+          // 複数ファイルでキー衝突しないようファイル名を付与してユニーク化
+          const baseTitle = sharedBase
+            ? files.length > 1
+              ? `${sharedBase} - ${fileBase}`
+              : sharedBase
+            : fileBase;
+          const title = uniquifyTitle(baseTitle, effectiveDate, taken);
+          return {
+            id: createId(),
+            kind: "file",
+            file,
+            mode,
+            title,
+            date: effectiveDate,
+            step: "idle",
+            nodeStatus: "",
+          };
+        });
+        return [...prev, ...newJobs];
+      });
+    },
+    []
+  );
+
+  const addTextJob = useCallback(
+    (sharedTitle = "", sharedDate = "") => {
+      setJobs((prev) => {
+        const textJobCount = prev.filter((j) => j.kind === "text").length;
+        if (textJobCount >= MAX_TEXT_SLOTS) return prev;
+
+        const effectiveDate = sharedDate || todayJst();
+        const sharedBase = sharedTitle.trim();
+        const taken = new Set<string>(
+          prev.map((j) => `${j.title}__${j.date}`)
+        );
+        const baseTitle =
+          sharedBase ||
+          `テキスト入力_${effectiveDate}_${uniqueTimeSuffix()}_${textJobCount + 1}`;
+        const title = uniquifyTitle(baseTitle, effectiveDate, taken);
+
+        const newJob: TextJob = {
+          id: createId(),
+          kind: "text",
+          text: "",
+          title,
+          date: effectiveDate,
+          step: "idle",
+          nodeStatus: "",
+        };
+        return [...prev, newJob];
+      });
+    },
+    []
+  );
+
+  const updateText = useCallback(
+    (id: string, text: string) => {
+      setJobs((prev) =>
+        prev.map((job) =>
+          job.id === id && job.kind === "text" ? { ...job, text } : job
+        )
+      );
     },
     []
   );
@@ -79,9 +184,17 @@ export function useKnowledgeJobs() {
     );
   }, []);
 
-  const clearCompleted = useCallback(() => {
+  const clearCompleted = useCallback((jobIds?: string[]) => {
+    const allowedSet = jobIds ? new Set(jobIds) : null;
     setJobs((prev) =>
-      prev.filter((job) => job.step !== "completed" && job.step !== "error")
+      prev.filter((job) => {
+        const isDoneOrError =
+          job.step === "completed" || job.step === "error";
+        if (!isDoneOrError) return true;
+        // 対象IDが指定されている場合は、その範囲内の完了/失敗ジョブのみ削除
+        if (allowedSet && !allowedSet.has(job.id)) return true;
+        return false;
+      })
     );
   }, []);
 
@@ -99,17 +212,25 @@ export function useKnowledgeJobs() {
     [patchJob]
   );
 
-  const runAll = useCallback(async () => {
+  const runAll = useCallback(async (jobIds?: string[]) => {
+    const allowedSet = jobIds ? new Set(jobIds) : null;
     const pending = jobsRef.current.filter(
-      (j) => j.step === "idle" || j.step === "error"
+      (j) =>
+        (j.step === "idle" || j.step === "error") &&
+        (!allowedSet || allowedSet.has(j.id))
     );
-    if (pending.length === 0 || isRunning) return;
+    const runnable = pending.filter((j) => {
+      if (j.kind === "file") return true;
+      return j.text.trim().length > 10;
+    });
+    if (runnable.length === 0 || isRunning) return;
 
     setIsRunning(true);
 
+    const runnableIds = new Set(runnable.map((j) => j.id));
     setJobs((prev) =>
       prev.map((job) =>
-        job.step === "idle" || job.step === "error"
+        runnableIds.has(job.id)
           ? {
               ...job,
               step: "uploading",
@@ -123,13 +244,15 @@ export function useKnowledgeJobs() {
       )
     );
 
-    const queue = [...pending];
+    const queue = [...runnable];
     const runOne = async (job: KnowledgeJob) => {
+      const input = job.kind === "file" ? job.file : job.text;
+      const mode = job.kind === "file" ? job.mode : "text";
       await runKnowledgeUpload(
         {
-          input: job.file,
-          mode: job.mode,
-          mtgTitle: job.title || stripExtension(job.file.name),
+          input,
+          mode,
+          mtgTitle: job.title,
           mtgDate: job.date || todayJst(),
         },
         {
@@ -161,6 +284,8 @@ export function useKnowledgeJobs() {
     jobs,
     isRunning,
     addFiles,
+    addTextJob,
+    updateText,
     removeJob,
     updateTitle,
     updateDate,

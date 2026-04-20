@@ -6,8 +6,10 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_LLM_MODEL = "gemini-2.5-flash";
 const EMBEDDING_BATCH_SIZE = 100;
 
-// QA生成の並列度（Gemini 2.5 FlashのRPM制限を考慮して6に設定）
-const QA_CONCURRENCY = 6;
+// QA生成の並列度。クライアント側で最大10ジョブ並列実行されるため、
+// 合計 10 × QA_CONCURRENCY が Gemini への同時リクエスト数になる。
+// Gemini 2.5 Flash の RPM 制限を踏まえ、合計 ~20 並列に収まる 2 に設定。
+const QA_CONCURRENCY = 2;
 // Gemini fetch のタイムアウト（ミリ秒）
 const GEMINI_FETCH_TIMEOUT_MS = 60_000;
 // リトライ最大回数（初回 + リトライN回）

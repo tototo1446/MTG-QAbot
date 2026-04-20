@@ -12,17 +12,24 @@ export async function POST(request: NextRequest) {
     const rawDate = (formData.get("mtg_date") as string | null)?.trim() || "";
     const mode = (formData.get("mode") as string) || "file";
 
-    const todayJst = () => {
-      const now = new Date();
-      const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-      return jst.toISOString().slice(0, 10);
+    const nowJst = () => new Date(Date.now() + 9 * 60 * 60 * 1000);
+    const todayJst = () => nowJst().toISOString().slice(0, 10);
+    // HHMMSSmmm + ランダム英数 — 同秒内の並列リクエストでもキーが衝突しないよう
+    // ミリ秒 + 短いランダムサフィックスで一意化する
+    const uniqueTimeSuffix = () => {
+      const iso = nowJst().toISOString();
+      const hhmmssMs = iso.slice(11, 23).replace(/[:.]/g, ""); // HHMMSSmmm
+      const rand = Math.random().toString(36).slice(2, 6); // 4文字のランダム
+      return `${hhmmssMs}${rand}`;
     };
     const stripExtension = (name: string) => name.replace(/\.[^./\\]+$/, "");
 
     const mtgDate = rawDate || todayJst();
     const mtgTitle =
       rawTitle ||
-      (file?.name ? stripExtension(file.name) : `テキスト入力_${mtgDate}`);
+      (file?.name
+        ? stripExtension(file.name)
+        : `テキスト入力_${mtgDate}_${uniqueTimeSuffix()}`);
 
     // Extract transcript text
     let transcriptText: string;
