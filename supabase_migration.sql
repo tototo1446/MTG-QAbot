@@ -198,3 +198,28 @@ BEGIN
   LIMIT p_limit;
 END;
 $$;
+
+
+-- ============================================================
+-- 3. get_existing_projects RPC関数（プロジェクト一覧取得）
+-- AI自動プロジェクト分類で、コーパスサイズに依存しない軽量な
+-- DISTINCT project 取得を行う。payload は project 種類数に比例のみ。
+-- singleton project（そのMTG1件だけが持つラベル）も全て返し、
+-- 再処理時のカテゴリ churn を防ぐ。現在ラベルの保持は呼び出し側で行う。
+-- ============================================================
+
+-- 旧バージョンの引数付き関数を削除（シグネチャ変更のため）
+DROP FUNCTION IF EXISTS get_existing_projects(text, text);
+
+CREATE OR REPLACE FUNCTION get_existing_projects()
+RETURNS TABLE(project text)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT DISTINCT k.project
+  FROM qa_knowledge k
+  WHERE k.status = 'active'
+    AND k.project IS NOT NULL
+    AND k.project != ''
+  ORDER BY k.project;
+$$;

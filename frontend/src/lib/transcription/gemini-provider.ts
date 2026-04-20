@@ -2,7 +2,7 @@ import type { TranscriptionProvider, TranscriptionResult } from "./types";
 import type { WhisperSegment } from "@/lib/transcript-normalizer";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL = "gemini-3.1-flash-lite-preview";
+const GEMINI_MODEL = "gemini-3-flash-preview";
 const MAX_INLINE_SIZE = 15 * 1024 * 1024; // 15MB（inline_data上限の余裕）
 
 /**

@@ -3,7 +3,7 @@ import { supabase } from "@/lib/supabase";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_LLM_MODEL = "gemini-2.5-flash";
+const GEMINI_LLM_MODEL = "gemini-3-flash-preview";
 const EMBEDDING_BATCH_SIZE = 100;
 
 // QA生成の並列度。クライアント側で最大10ジョブ並列実行されるため、
@@ -122,7 +122,7 @@ interface TranscriptStats {
   retainedRatio: number;
 }
 
-// --- Project Classification (from backfill-projects) ---
+// --- Project Classification ---
 
 const PROJECT_RULES: [string[], string][] = [
   [["youtube", "yt", "動画", "サムネ", "チャンネル"], "YouTube運用"],
@@ -132,7 +132,7 @@ const PROJECT_RULES: [string[], string][] = [
   [["定例", "全体"], "全体定例"],
 ];
 
-function classifyProject(mtgTitle: string): string {
+function classifyProjectByRule(mtgTitle: string): string {
   const title = mtgTitle.toLowerCase();
   for (const [keywords, project] of PROJECT_RULES) {
     for (const kw of keywords) {
@@ -142,6 +142,152 @@ function classifyProject(mtgTitle: string): string {
     }
   }
   return "";
+}
+
+async function fetchExistingProjects(): Promise<string[]> {
+  // DB側で DISTINCT を行う RPC を呼び出す。
+  // payload はプロジェクト種類数に比例するのみで、コーパスサイズに依存しない。
+  // singleton project も含めて全て返す（再処理時のカテゴリ churn 回避のため）。
+  const { data, error } = await supabase.rpc("get_existing_projects");
+
+  if (error) {
+    // Fail closed: 呼び出し元の try-catch で現在ラベル or rule-based にフォールバック。
+    // 空配列を返すと新規カテゴリが勝手に作られてしまうため、例外で明示的に失敗させる。
+    throw new Error(`既存プロジェクト取得失敗: ${error.message}`);
+  }
+
+  return ((data || []) as { project: string }[])
+    .map((r) => r.project)
+    .filter(Boolean);
+}
+
+/**
+ * 再処理対象MTGに既に付与されているproject（= 現在ラベル）を取得。
+ * 存在しない or エラー時は null を返し、新規アップロード扱いにする。
+ *
+ * 注: 1 MTG = 多数のQA行なので maybeSingle() は使えない（複数行ヒットでエラーになる）。
+ * .limit(1) で1行だけ取得して先頭要素から project を取り出す。
+ */
+async function fetchCurrentProjectForMtg(
+  mtgTitle: string,
+  mtgDate: string
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("qa_knowledge")
+    .select("project")
+    .eq("mtg_title", mtgTitle)
+    .eq("mtg_date", mtgDate)
+    .eq("status", "active")
+    .neq("project", "")
+    .not("project", "is", null)
+    .limit(1);
+
+  if (error) {
+    console.warn("現在プロジェクト取得エラー:", error.message);
+    return null;
+  }
+
+  return data?.[0]?.project ?? null;
+}
+
+interface ClassifyInput {
+  mtgTitle: string;
+  summary: string;
+  qaSamples: { question: string; answer: string; topic: string }[];
+  existingProjects: string[];
+  currentProject: string | null;
+}
+
+async function classifyProjectWithAI(input: ClassifyInput): Promise<string> {
+  const { mtgTitle, summary, qaSamples, existingProjects, currentProject } = input;
+
+  const systemPrompt = `あなたはMTGナレッジのプロジェクト分類の専門家です。
+
+## タスク
+
+MTGの内容を分析し、プロジェクトカテゴリを決定してください。
+
+## ルール
+
+- **現在のラベルが既に付いている場合、内容が大きく変わっていなければ原則そのラベルを維持してください**（再処理でカテゴリがブレるのを防ぐため）
+- 現在のラベルと内容が明らかに合わない場合のみ、別のカテゴリに変更してください
+- 既存プロジェクト一覧の中に概念的に類似するカテゴリがあれば、そのカテゴリ名を**そのまま**返してください
+- 類似度が明らかに低い場合のみ、新しいカテゴリ名を提案してください
+- カテゴリ名は簡潔に、業務単位で（例: "YouTube運用", "ミサオch", "バズ塾" のような粒度）
+- 既存プロジェクトの命名規則・粒度を参考にしてください
+- 個別の議事録単位ではなく、**継続的な業務カテゴリ**として名付けてください
+
+## 出力形式
+
+必ず以下のJSON形式のみで回答してください。説明文やマークダウンは不要です。
+
+{"project": "プロジェクト名", "reasoning": "判断理由（簡潔に）"}`;
+
+  const samplesText = qaSamples
+    .slice(0, 5)
+    .map(
+      (qa, i) =>
+        `[${i + 1}] トピック: ${qa.topic}\nQ: ${qa.question}\nA: ${qa.answer}`
+    )
+    .join("\n\n");
+
+  const userPrompt = `## MTGタイトル
+${mtgTitle}
+
+## 現在のラベル
+${currentProject || "（未分類 / 新規アップロード）"}
+
+## MTG要約
+${summary || "（要約なし）"}
+
+## QAサンプル
+${samplesText || "（サンプルなし）"}
+
+## 既存プロジェクト一覧
+${
+  existingProjects.length > 0
+    ? existingProjects.map((p) => `- ${p}`).join("\n")
+    : "（まだプロジェクトは存在しません）"
+}
+
+上記のMTG内容を分析し、最も適切なプロジェクトカテゴリを決定してください。`;
+
+  const res = await fetchWithRetry(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.4-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.2,
+      }),
+    },
+    { timeoutMs: 30_000 }
+  );
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`プロジェクト分類APIエラー: ${errText}`);
+  }
+
+  const data = await res.json();
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error("プロジェクト分類: レスポンスが空です");
+
+  const parsed = JSON.parse(content);
+  const project = (parsed.project || "").trim();
+
+  if (!project) throw new Error("プロジェクト分類: 空の結果が返されました");
+
+  return project;
 }
 
 // --- 1. Text Parsing (Dify code_parse equivalent) ---
@@ -632,7 +778,12 @@ export async function runKnowledgePipeline(
   send({ event: "node_finished", data: { status: "succeeded", title: "チャンク分割" } });
 
   // Step 3: QA generation per chunk（並列実行）
-  const allQAPairs: (QAPair & { topic: string; time_range: string })[] = [];
+  // 並列完了順に依存せず transcript 順で扱えるよう chunkIndex を保持する
+  const allQAPairs: (QAPair & {
+    topic: string;
+    time_range: string;
+    chunkIndex: number;
+  })[] = [];
   const totalChunks = effectiveChunks.length;
   let completedCount = 0;
   let failedCount = 0;
@@ -651,6 +802,7 @@ export async function runKnowledgePipeline(
           ...qa,
           topic: chunk.topic,
           time_range: chunk.time_range,
+          chunkIndex: idx,
         });
       }
       completedCount++;
@@ -680,9 +832,69 @@ export async function runKnowledgePipeline(
     throw new Error("QAペアが1つも生成できませんでした。");
   }
 
+  // Step 3.5: AI Project Classification
+  send({ event: "node_started", data: { title: "プロジェクト分類" } });
+  let project = "";
+  // 再処理時の現在ラベル（削除される前に取得）。transient 失敗時の既存ラベル保持、
+  // および singleton project の churn 回避に使う。
+  const currentProject = await fetchCurrentProjectForMtg(mtgTitle, mtgDate);
+  try {
+    const existingProjects = await fetchExistingProjects();
+    // singleton project（自MTGだけが持つラベル）も候補に含め、再処理時の rename を防ぐ
+    const candidates =
+      currentProject && !existingProjects.includes(currentProject)
+        ? [...existingProjects, currentProject].sort()
+        : existingProjects;
+
+    // 並列生成で順不同になった QA を chunkIndex で安定ソートし、
+    // 同じ入力に対して常に同じサンプルが分類器に渡るようにする
+    const orderedQAPairs = [...allQAPairs].sort(
+      (a, b) => a.chunkIndex - b.chunkIndex
+    );
+    project = await classifyProjectWithAI({
+      mtgTitle,
+      summary,
+      qaSamples: orderedQAPairs.map((qa) => ({
+        question: qa.question,
+        answer: qa.answer,
+        topic: qa.topic,
+      })),
+      existingProjects: candidates,
+      currentProject,
+    });
+    send({
+      event: "node_finished",
+      data: { status: "succeeded", title: `プロジェクト分類: ${project}` },
+    });
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : "不明なエラー";
+    // transient failure 時：既存ラベルがあればそれを保持して破壊的変更を防ぐ。
+    // 未分類（新規MTG）の場合のみ rule-based にフォールバック。
+    if (currentProject) {
+      project = currentProject;
+      send({
+        event: "node_finished",
+        data: {
+          status: "warning",
+          title: "プロジェクト分類",
+          error: `AI分類に失敗したため既存ラベル「${currentProject}」を維持: ${errorMsg}`,
+        },
+      });
+    } else {
+      project = classifyProjectByRule(mtgTitle);
+      send({
+        event: "node_finished",
+        data: {
+          status: "warning",
+          title: "プロジェクト分類",
+          error: `AI分類に失敗したためルールベースにフォールバック: ${errorMsg}${project ? `（${project}）` : "（未分類）"}`,
+        },
+      });
+    }
+  }
+
   // Step 4: Database insert (既存データがあれば置き換え)
   send({ event: "node_started", data: { title: "データベース書き込み" } });
-  const project = classifyProject(mtgTitle);
 
   // 同じMTGの既存QAデータを削除（重複防止）
   const { error: deleteError } = await supabase
